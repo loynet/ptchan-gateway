@@ -15,6 +15,9 @@
 /.env.*
 !/.env.example
 
+# Local config
+/config/*.toml
+
 # Editor and OS state
 /.vscode/
 /.idea/
