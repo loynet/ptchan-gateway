@@ -1,0 +1,29 @@
+# Rust build output
+/target/
+/ptchan-gateway
+
+# Local runtime state
+/data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+
+# Local environment and secrets
+/.env
+/.env.*
+!/.env.example
+
+# Editor and OS state
+/.vscode/
+/.idea/
+.DS_Store
+
+# Local reports and temporary artifacts
+/coverage/
+/tmp/
+*.profraw
+*.tar
+*.tar.gz
+*.zip

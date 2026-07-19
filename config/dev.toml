@@ -1,0 +1,23 @@
+[ptchan]
+base_url = "https://ptchan.org"
+user_agent = "ptchan-gateway/0.1.0"
+session_refresh_fallback_interval = "12h"
+socket_reconnect_min = "3s"
+socket_reconnect_max = "60s"
+
+[[webhook]]
+name = "example"
+url = "http://127.0.0.1:8081/internal/ptchan/events"
+allowed_boards = []
+include_poster_fingerprint = false
+
+[runtime]
+http_addr = "0.0.0.0:8080"
+
+[runtime.logging]
+level = "info"
+format = "json"
+
+[storage]
+sqlite_path = "data/ptchan-gateway.db"
+event_retention = "14d"

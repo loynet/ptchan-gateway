@@ -1,0 +1,44 @@
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # rust_socketio 0.6.0 depends on backoff 0.4, which is unmaintained and
+    # pulls instant 0.1. There is no safe rust_socketio upgrade today; replacing
+    # the Socket.IO client is tracked as a follow-up because ptchan requires
+    # Socket.IO client protocol compatibility.
+    "RUSTSEC-2025-0012",
+    "RUSTSEC-2024-0384",
+]
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
