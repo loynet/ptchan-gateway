@@ -70,7 +70,7 @@ fn consumer_post(base_url: &str, post: upstream::Post) -> consumer::Post {
         tripcode: clean(post.tripcode),
         capcode: clean(post.capcode),
         donor: post.donor,
-        country: clean(post.country),
+        country: country_code(post.country),
         poster_fingerprint: None,
         attachment_count: post.files.len(),
         references: post_refs(post.quotes, &board, thread_id),
@@ -169,6 +169,10 @@ fn clean(value: Option<String>) -> Option<String> {
     })
 }
 
+fn country_code(country: Option<upstream::Country>) -> Option<String> {
+    country.and_then(|country| clean(country.code))
+}
+
 fn poster_identity_source(value: &Value) -> Option<String> {
     value
         .pointer("/ip/cloak")
@@ -237,7 +241,7 @@ mod tests {
             "_id": "mongo",
             "date": "2026-07-19T12:00:00.000Z",
             "name": " anon ",
-            "country": "PT",
+            "country": { "code": "PT", "name": "Portugal" },
             "board": "i",
             "subject": "hello",
             "message": "body",
@@ -263,6 +267,7 @@ mod tests {
         assert_eq!(built.event.kind, EventKind::ThreadCreated);
         assert_eq!(built.event.post.thread_id, 100);
         assert_eq!(built.event.post.name.as_deref(), Some("anon"));
+        assert_eq!(built.event.post.country.as_deref(), Some("PT"));
         assert_eq!(built.event.post.donor, None);
         assert_eq!(built.event.post.attachment_count, 1);
         let text = String::from_utf8(built.payload).unwrap();
@@ -358,6 +363,35 @@ mod tests {
 
         assert_eq!(built.event.post.donor, Some(true));
         assert!(text.contains("\"donor\":true"));
+    }
+
+    #[test]
+    fn accepts_posts_without_country() {
+        let payload = json!({
+            "date": "2026-07-19T12:00:00.000Z",
+            "board": "pn",
+            "thread": 100,
+            "postId": 101,
+            "message": "reply"
+        });
+        let post = consumer_post_from_value("https://ptchan.test", payload).unwrap();
+
+        assert_eq!(post.country, None);
+    }
+
+    #[test]
+    fn accepts_null_country() {
+        let payload = json!({
+            "date": "2026-07-19T12:00:00.000Z",
+            "board": "pn",
+            "thread": 100,
+            "postId": 101,
+            "message": "reply",
+            "country": null
+        });
+        let post = consumer_post_from_value("https://ptchan.test", payload).unwrap();
+
+        assert_eq!(post.country, None);
     }
 
     #[test]

@@ -9,7 +9,7 @@ pub(crate) struct Post {
     #[serde(default)]
     pub(crate) name: Option<String>,
     #[serde(default)]
-    pub(crate) country: Option<String>,
+    pub(crate) country: Option<Country>,
     pub(crate) board: String,
     #[serde(default)]
     pub(crate) tripcode: Option<String>,
@@ -33,6 +33,12 @@ pub(crate) struct Post {
     pub(crate) quotes: Vec<Value>,
     #[serde(default)]
     pub(crate) backlinks: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct Country {
+    #[serde(default)]
+    pub(crate) code: Option<String>,
 }
 
 pub(crate) fn post_from_value(value: &Value) -> Result<Post> {
