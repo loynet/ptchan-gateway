@@ -21,6 +21,21 @@ public author labels, donor status, attachment counts, and typed
 Payloads do not include raw IPs, upstream cloaks, session data, permissions,
 raw upstream JSON, file names, file hashes, or secrets.
 
+## Delivery Guarantees
+
+Webhook delivery is durable and at-least-once. The gateway writes events and
+per-consumer delivery rows to SQLite before sending webhooks, retries failed
+deliveries with backoff, signs every request, and retains pending events until
+all configured deliveries have succeeded.
+
+Webhook ordering is best-effort, not a correctness guarantee. Pending deliveries
+are attempted by next retry time, but an earlier event that fails can be retried
+after a later event has already been delivered. Consumers must treat
+`x-ptchan-event-id` as an idempotency key and tolerate duplicate, delayed, or
+out-of-order webhooks. Consumers that need current thread state should use the
+signed thread context endpoint instead of deriving correctness from webhook
+order alone.
+
 ## Setup
 
 ```bash

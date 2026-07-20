@@ -21,6 +21,13 @@ Webhook delivery must also enforce `allowed_boards`. A webhook with an empty
 `allowed_boards` list receives all boards; otherwise it receives only matching
 boards.
 
+Webhook delivery is durable and at-least-once, but ordering is best-effort.
+Retries can cause later events to reach a consumer before earlier events.
+Consumers must use `x-ptchan-event-id` / `event_id` for idempotency and tolerate
+duplicates, delayed delivery, and out-of-order delivery. Do not document or
+implement consumer behavior that depends on strict webhook ordering unless the
+storage and delivery model is explicitly changed.
+
 ## How To Work
 
 Use the Makefile:
