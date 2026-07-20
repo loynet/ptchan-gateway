@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
@@ -32,4 +33,11 @@ pub(crate) struct Post {
     pub(crate) quotes: Vec<Value>,
     #[serde(default)]
     pub(crate) backlinks: Vec<Value>,
+}
+
+pub(crate) fn post_from_value(value: &Value) -> Result<Post> {
+    let text = value.to_string();
+    let mut deserializer = serde_json::Deserializer::from_str(&text);
+    serde_path_to_error::deserialize(&mut deserializer)
+        .map_err(|err| anyhow!("decode upstream post at {}: {}", err.path(), err.inner()))
 }

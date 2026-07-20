@@ -16,7 +16,8 @@ pub fn gateway_event(
     let poster_identity = poster_identity_source(&value);
     drop_upstream_ip_fields(&mut value);
     reject_sensitive_fields(&value)?;
-    let post: upstream::Post = serde_json::from_value(value).context("decode upstream newPost")?;
+    let post = upstream::post_from_value(&value)
+        .map_err(|err| anyhow!("decode upstream newPost: {err}"))?;
     let kind = if post.thread.is_some() {
         consumer::EventKind::PostCreated
     } else {
@@ -42,7 +43,8 @@ pub fn gateway_event(
 pub fn consumer_post_from_value(base_url: &str, mut value: Value) -> Result<consumer::Post> {
     drop_upstream_ip_fields(&mut value);
     reject_sensitive_fields(&value)?;
-    let post: upstream::Post = serde_json::from_value(value).context("decode upstream post")?;
+    let post =
+        upstream::post_from_value(&value).map_err(|err| anyhow!("decode upstream post: {err}"))?;
     Ok(consumer_post(base_url, post))
 }
 
