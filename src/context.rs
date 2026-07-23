@@ -10,18 +10,18 @@ use crate::{
     session::SessionCookie,
 };
 
-pub const DEFAULT_THREAD_LIMIT: usize = 50;
-pub const MAX_THREAD_LIMIT: usize = 200;
+pub(crate) const DEFAULT_THREAD_LIMIT: usize = 50;
+pub(crate) const MAX_THREAD_LIMIT: usize = 200;
 
 #[derive(Clone)]
-pub struct ThreadReader {
+pub(crate) struct ThreadReader {
     base_url: String,
     client: Client,
     cookie: Arc<SessionCookie>,
 }
 
 impl ThreadReader {
-    pub fn new(cfg: &PtchanConfig, cookie: Arc<SessionCookie>) -> Result<Self> {
+    pub(crate) fn new(cfg: &PtchanConfig, cookie: Arc<SessionCookie>) -> Result<Self> {
         let client = Client::builder()
             .user_agent(cfg.user_agent.clone())
             .build()
@@ -33,7 +33,7 @@ impl ThreadReader {
         })
     }
 
-    pub async fn fetch_thread(
+    pub(crate) async fn fetch_thread(
         &self,
         board: &str,
         thread_id: i64,

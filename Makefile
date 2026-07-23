@@ -31,7 +31,7 @@ endif
 
 check:
 	cargo fmt -- --check
-	cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic -W clippy::cargo -A clippy::cargo-common-metadata -A clippy::multiple-crate-versions
+	cargo clippy --all-targets --all-features -- -D warnings -W unreachable_pub -W clippy::pedantic -W clippy::cargo -A clippy::cargo-common-metadata -A clippy::multiple-crate-versions
 	cargo test
 	@if cargo metadata --no-deps --format-version 1 | rg '"kind":\["lib"\]' >/dev/null; then cargo test --doc; fi
 	$(LOAD_ENV); cargo run -- --check-config

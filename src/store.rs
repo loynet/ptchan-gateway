@@ -11,25 +11,25 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::metrics;
 
 #[derive(Clone)]
-pub struct Store {
+pub(crate) struct Store {
     inner: Arc<Mutex<Connection>>,
 }
 
 #[derive(Debug)]
-pub struct PendingDelivery {
-    pub event_id: String,
-    pub webhook: String,
-    pub payload: Vec<u8>,
-    pub attempts: i64,
+pub(crate) struct PendingDelivery {
+    pub(crate) event_id: String,
+    pub(crate) webhook: String,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) attempts: i64,
 }
 
-pub struct EventDelivery {
-    pub webhook: String,
-    pub payload: Vec<u8>,
+pub(crate) struct EventDelivery {
+    pub(crate) webhook: String,
+    pub(crate) payload: Vec<u8>,
 }
 
 impl Store {
-    pub fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
@@ -45,7 +45,7 @@ impl Store {
         })
     }
 
-    pub fn migrate(&self) -> Result<()> {
+    pub(crate) fn migrate(&self) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute_batch(
                 r"
@@ -81,7 +81,7 @@ impl Store {
         })
     }
 
-    pub fn create_event(
+    pub(crate) fn create_event(
         &self,
         event: &crate::consumer::WebhookEvent,
         payload: &[u8],
@@ -126,7 +126,7 @@ impl Store {
         })
     }
 
-    pub fn pending_deliveries(
+    pub(crate) fn pending_deliveries(
         &self,
         limit: usize,
         now: DateTime<Utc>,
@@ -158,7 +158,12 @@ impl Store {
         })
     }
 
-    pub fn mark_delivered(&self, event_id: &str, webhook: &str, now: DateTime<Utc>) -> Result<()> {
+    pub(crate) fn mark_delivered(
+        &self,
+        event_id: &str,
+        webhook: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
                 "UPDATE deliveries SET status = 'delivered', delivered_at = ?1 WHERE event_id = ?2 AND webhook = ?3",
@@ -169,7 +174,7 @@ impl Store {
         })
     }
 
-    pub fn mark_failed(
+    pub(crate) fn mark_failed(
         &self,
         event_id: &str,
         webhook: &str,
@@ -195,7 +200,7 @@ impl Store {
         })
     }
 
-    pub fn pending_count(&self) -> Result<i64> {
+    pub(crate) fn pending_count(&self) -> Result<i64> {
         self.with_conn(|conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM deliveries WHERE status = 'pending'",
@@ -206,7 +211,7 @@ impl Store {
         })
     }
 
-    pub fn next_delivery_delay(&self, now: DateTime<Utc>) -> Result<Option<Duration>> {
+    pub(crate) fn next_delivery_delay(&self, now: DateTime<Utc>) -> Result<Option<Duration>> {
         self.with_conn(|conn| {
             let next: Option<String> = conn
                 .query_row(
@@ -230,7 +235,7 @@ impl Store {
         })
     }
 
-    pub fn prune_delivered_events(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+    pub(crate) fn prune_delivered_events(&self, cutoff: DateTime<Utc>) -> Result<usize> {
         self.with_conn(|conn| {
             conn.execute(
                 "DELETE FROM events
@@ -246,7 +251,7 @@ impl Store {
         })
     }
 
-    pub fn is_ready(&self) -> bool {
+    pub(crate) fn is_ready(&self) -> bool {
         self.with_conn(|conn| {
             let value: Option<i64> = conn
                 .query_row("SELECT 1", [], |row| row.get(0))
@@ -268,7 +273,7 @@ impl Store {
     }
 }
 
-pub fn delivery_backoff(attempts: i64) -> Duration {
+pub(crate) fn delivery_backoff(attempts: i64) -> Duration {
     let exp = u32::try_from(attempts.clamp(1, 8)).unwrap_or(8);
     Duration::from_secs((2_u64.pow(exp)).min(300))
 }

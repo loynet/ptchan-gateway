@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
@@ -17,7 +17,7 @@ use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 use tracing::{debug, warn};
 
 use crate::{
-    config::WebhookConfig,
+    config::{self, WebhookConfig},
     context::{ThreadReader, DEFAULT_THREAD_LIMIT},
     metrics,
     store::Store,
@@ -27,33 +27,33 @@ type HmacSha256 = Hmac<Sha256>;
 const REQUEST_MAX_SKEW_SECONDS: i64 = 5 * 60;
 
 #[derive(Default)]
-pub struct Status {
+pub(crate) struct Status {
     upstream_joined: std::sync::atomic::AtomicBool,
     auth_healthy: std::sync::atomic::AtomicBool,
 }
 
 impl Status {
-    pub fn set_upstream_joined(&self, joined: bool) {
+    pub(crate) fn set_upstream_joined(&self, joined: bool) {
         self.upstream_joined
             .store(joined, std::sync::atomic::Ordering::Relaxed);
         metrics::SOCKET_JOINED.set(i64::from(joined));
     }
 
-    pub fn set_auth_healthy(&self, healthy: bool) {
+    pub(crate) fn set_auth_healthy(&self, healthy: bool) {
         self.auth_healthy
             .store(healthy, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn auth_healthy(&self) -> bool {
+    pub(crate) fn auth_healthy(&self) -> bool {
         self.auth_healthy.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn upstream_joined(&self) -> bool {
+    pub(crate) fn upstream_joined(&self) -> bool {
         self.upstream_joined
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn ready(&self) -> bool {
+    pub(crate) fn ready(&self) -> bool {
         self.auth_healthy() && self.upstream_joined()
     }
 }
@@ -66,7 +66,7 @@ struct AppState {
     consumers: Arc<HashMap<String, WebhookConfig>>,
 }
 
-pub async fn spawn_http(
+pub(crate) async fn spawn_http(
     addr: String,
     status: Arc<Status>,
     store: Arc<Store>,
@@ -75,7 +75,7 @@ pub async fn spawn_http(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<JoinHandle<Result<()>>> {
     metrics::init();
-    let listener = TcpListener::bind(normalize_addr(&addr)?)
+    let listener = TcpListener::bind(config::runtime_addr(&addr)?)
         .await
         .context("bind runtime http")?;
     let local_addr = listener.local_addr().context("runtime local addr")?;
@@ -255,8 +255,8 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
 }
 
-pub async fn check_health(addr: &str) -> Result<()> {
-    let url = format!("http://{}/healthz", normalize_addr(addr)?);
+pub(crate) async fn check_health(addr: &str) -> Result<()> {
+    let url = format!("http://{}/healthz", config::runtime_addr(addr)?);
     let response = Client::new()
         .get(url)
         .send()
@@ -267,17 +267,6 @@ pub async fn check_health(addr: &str) -> Result<()> {
     }
     println!("ok");
     Ok(())
-}
-
-fn normalize_addr(addr: &str) -> Result<SocketAddr> {
-    let normalized = if let Some(port) = addr.strip_prefix(':') {
-        format!("0.0.0.0:{port}")
-    } else {
-        addr.to_string()
-    };
-    normalized
-        .parse()
-        .with_context(|| format!("parse address {addr}"))
 }
 
 #[cfg(test)]
@@ -317,7 +306,7 @@ mod tests {
         let cfg = PtchanConfig {
             base_url: "https://ptchan.test".to_string(),
             user_agent: "ptchan-gateway-test".to_string(),
-            session_refresh_fallback_interval: Duration::from_secs(60),
+            session_refresh_fallback_interval: Duration::from_mins(1),
             socket_reconnect_min: Duration::from_secs(1),
             socket_reconnect_max: Duration::from_secs(2),
         };

@@ -17,9 +17,9 @@ use crate::{
 };
 
 type HmacSha256 = Hmac<Sha256>;
-const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const IDLE_SWEEP_INTERVAL: Duration = Duration::from_mins(1);
 
-pub async fn delivery_loop(
+pub(crate) async fn delivery_loop(
     webhooks: Vec<WebhookConfig>,
     store: Arc<store::Store>,
     wakeup: Arc<Notify>,

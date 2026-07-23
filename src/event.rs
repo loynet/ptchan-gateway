@@ -8,16 +8,15 @@ use crate::{consumer, upstream};
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub fn gateway_event(
+pub(crate) fn gateway_event(
     base_url: &str,
-    mut value: Value,
+    value: Value,
     observed_at: DateTime<Utc>,
 ) -> Result<BuiltEvent> {
-    let poster_identity = poster_identity_source(&value);
-    drop_upstream_ip_fields(&mut value);
-    reject_sensitive_fields(&value)?;
-    let post = upstream::post_from_value(&value)
+    let decoded = upstream::DecodedPost::try_from(value)
         .map_err(|err| anyhow!("decode upstream newPost: {err}"))?;
+    let poster_identity = decoded.poster_identity;
+    let post = decoded.post;
     let kind = if post.thread.is_some() {
         consumer::EventKind::PostCreated
     } else {
@@ -40,12 +39,10 @@ pub fn gateway_event(
     })
 }
 
-pub fn consumer_post_from_value(base_url: &str, mut value: Value) -> Result<consumer::Post> {
-    drop_upstream_ip_fields(&mut value);
-    reject_sensitive_fields(&value)?;
-    let post =
-        upstream::post_from_value(&value).map_err(|err| anyhow!("decode upstream post: {err}"))?;
-    Ok(consumer_post(base_url, post))
+pub(crate) fn consumer_post_from_value(base_url: &str, value: Value) -> Result<consumer::Post> {
+    let post = upstream::DecodedPost::try_from(value)
+        .map_err(|err| anyhow!("decode upstream post: {err}"))?;
+    Ok(consumer_post(base_url, post.post))
 }
 
 fn consumer_post(base_url: &str, post: upstream::Post) -> consumer::Post {
@@ -65,7 +62,7 @@ fn consumer_post(base_url: &str, post: upstream::Post) -> consumer::Post {
         url,
         date: post.date,
         subject: clean(post.subject),
-        message: clean(post.message.or(post.nomarkup)),
+        message: consumer_message(post.nomarkup, post.message),
         name: clean(post.name),
         tripcode: clean(post.tripcode),
         capcode: clean(post.capcode),
@@ -79,19 +76,19 @@ fn consumer_post(base_url: &str, post: upstream::Post) -> consumer::Post {
 }
 
 #[derive(Debug)]
-pub struct BuiltEvent {
-    pub event: consumer::WebhookEvent,
-    pub payload: Vec<u8>,
-    pub poster_identity: Option<String>,
+pub(crate) struct BuiltEvent {
+    pub(crate) event: consumer::WebhookEvent,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) poster_identity: Option<String>,
 }
 
-pub fn encode_event(event: &consumer::WebhookEvent) -> Result<Vec<u8>> {
+pub(crate) fn encode_event(event: &consumer::WebhookEvent) -> Result<Vec<u8>> {
     let payload = serde_json::to_vec(event).context("encode gateway event")?;
-    assert_no_sensitive_json(&payload)?;
+    upstream::assert_consumer_safe(&payload)?;
     Ok(payload)
 }
 
-pub fn poster_fingerprint(
+pub(crate) fn poster_fingerprint(
     secret: &str,
     scope: &str,
     source: Option<&str>,
@@ -169,65 +166,15 @@ fn clean(value: Option<String>) -> Option<String> {
     })
 }
 
+fn consumer_message(nomarkup: Option<String>, message: Option<String>) -> Option<String> {
+    // Upstream `message` is rendered HTML. `nomarkup` is the readable post text
+    // consumers need; fall back only when upstream does not provide it.
+    clean(nomarkup).or_else(|| clean(message))
+}
+
 fn country_code(country: Option<upstream::Country>) -> Option<String> {
     country.and_then(|country| clean(country.code))
 }
-
-fn poster_identity_source(value: &Value) -> Option<String> {
-    value
-        .pointer("/ip/cloak")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn drop_upstream_ip_fields(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            if map.remove("ip").is_some() {
-                metrics::REDACTION_DROPS.inc();
-            }
-            for child in map.values_mut() {
-                drop_upstream_ip_fields(child);
-            }
-        }
-        Value::Array(values) => {
-            for child in values {
-                drop_upstream_ip_fields(child);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn reject_sensitive_fields(value: &Value) -> Result<()> {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                if matches!(key.as_str(), "raw" | "cloak" | "session" | "permissions") {
-                    metrics::REDACTION_DROPS.inc();
-                    return Err(anyhow!("upstream payload contains sensitive field {key}"));
-                }
-                reject_sensitive_fields(child)?;
-            }
-        }
-        Value::Array(values) => {
-            for child in values {
-                reject_sensitive_fields(child)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn assert_no_sensitive_json(payload: &[u8]) -> Result<()> {
-    let value: Value = serde_json::from_slice(payload).context("decode encoded event payload")?;
-    reject_sensitive_fields(&value)
-}
-
-use crate::metrics;
 
 #[cfg(test)]
 mod tests {
@@ -276,24 +223,6 @@ mod tests {
         assert!(!text.contains("\"raw\""));
         assert!(!text.contains("originalFilename"));
         assert!(!text.contains("public-file-hash"));
-    }
-
-    #[test]
-    fn drops_ip_fields_before_forwarding() {
-        let payload = json!({
-            "date": "2026-07-19T12:00:00.000Z",
-            "board": "i",
-            "thread": 100,
-            "postId": 101,
-            "message": "reply",
-            "ip": { "cloak": "hash", "raw": null, "type": "ip" }
-        });
-        let built = gateway_event("https://ptchan.test", payload, Utc::now()).unwrap();
-        let text = String::from_utf8(built.payload).unwrap();
-        assert!(!text.contains("\"ip\""));
-        assert!(!text.contains("\"cloak\""));
-        assert!(!text.contains("\"raw\""));
-        assert_eq!(built.poster_identity.as_deref(), Some("hash"));
     }
 
     #[test]
@@ -349,6 +278,47 @@ mod tests {
     }
 
     #[test]
+    fn prefers_plain_nomarkup_message_for_consumers() {
+        let payload = json!({
+            "date": "2026-07-19T12:00:00.000Z",
+            "board": "i",
+            "thread": 303_822,
+            "postId": 303_921,
+            "message": "<a class=\"quote\" href=\"/i/thread/303822.html#303918\">&gt;&gt;303918</a>",
+            "nomarkup": ">>303918"
+        });
+
+        let post = consumer_post_from_value("https://ptchan.test", payload).unwrap();
+
+        assert_eq!(post.message.as_deref(), Some(">>303918"));
+    }
+
+    #[test]
+    fn falls_back_to_rendered_message_when_nomarkup_is_missing_or_empty() {
+        let missing = json!({
+            "date": "2026-07-19T12:00:00.000Z",
+            "board": "i",
+            "thread": 100,
+            "postId": 101,
+            "message": "rendered body"
+        });
+        let empty = json!({
+            "date": "2026-07-19T12:00:00.000Z",
+            "board": "i",
+            "thread": 100,
+            "postId": 102,
+            "message": "rendered body",
+            "nomarkup": " "
+        });
+
+        let missing_post = consumer_post_from_value("https://ptchan.test", missing).unwrap();
+        let empty_post = consumer_post_from_value("https://ptchan.test", empty).unwrap();
+
+        assert_eq!(missing_post.message.as_deref(), Some("rendered body"));
+        assert_eq!(empty_post.message.as_deref(), Some("rendered body"));
+    }
+
+    #[test]
     fn preserves_public_donor_flag() {
         let payload = json!({
             "date": "2026-07-19T12:00:00.000Z",
@@ -392,19 +362,5 @@ mod tests {
         let post = consumer_post_from_value("https://ptchan.test", payload).unwrap();
 
         assert_eq!(post.country, None);
-    }
-
-    #[test]
-    fn rejects_sensitive_fields_outside_ip_envelope() {
-        let payload = json!({
-            "date": "2026-07-19T12:00:00.000Z",
-            "board": "i",
-            "thread": 100,
-            "postId": 101,
-            "message": "reply",
-            "cloak": "hash"
-        });
-        let err = gateway_event("https://ptchan.test", payload, Utc::now()).unwrap_err();
-        assert!(err.to_string().contains("sensitive field cloak"));
     }
 }

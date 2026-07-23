@@ -11,10 +11,10 @@ use tracing::{debug, info, warn};
 
 use crate::{config::PtchanConfig, metrics, runtime::Status};
 
-const SESSION_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(60);
-const SESSION_REFRESH_MAX_SAFETY_MARGIN: Duration = Duration::from_secs(60 * 60);
+const SESSION_REFRESH_RETRY_INTERVAL: Duration = Duration::from_mins(1);
+const SESSION_REFRESH_MAX_SAFETY_MARGIN: Duration = Duration::from_hours(1);
 
-pub struct SessionCookie {
+pub(crate) struct SessionCookie {
     cookies: RwLock<Vec<StoredCookie>>,
 }
 
@@ -26,7 +26,7 @@ struct StoredCookie {
 }
 
 impl SessionCookie {
-    pub fn new(value: &str) -> Self {
+    pub(crate) fn new(value: &str) -> Self {
         let parsed = parse_cookie_header(value, Utc::now());
         Self {
             cookies: RwLock::new(
@@ -43,7 +43,7 @@ impl SessionCookie {
         }
     }
 
-    pub fn get(&self) -> String {
+    pub(crate) fn get(&self) -> String {
         self.cookies
             .read()
             .expect("cookie lock poisoned")
@@ -162,7 +162,7 @@ fn parse_cookie_max_age(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>
     Some(now + chrono::Duration::seconds(seconds))
 }
 
-pub async fn refresh_loop(
+pub(crate) async fn refresh_loop(
     cfg: PtchanConfig,
     cookie: Arc<SessionCookie>,
     status: Arc<Status>,
@@ -364,8 +364,8 @@ mod tests {
         let cookie = SessionCookie::new("session=s%3Aabc; Expires=Wed, 22 Jul 2026 12:00:00 GMT");
 
         assert_eq!(
-            next_refresh_delay(&cookie, Duration::from_secs(12 * 60 * 60), now),
-            Duration::from_secs((3 * 24 * 60 * 60) - (60 * 60))
+            next_refresh_delay(&cookie, Duration::from_hours(12), now),
+            Duration::from_hours((3 * 24) - 1)
         );
     }
 
@@ -375,8 +375,8 @@ mod tests {
         let cookie = SessionCookie::new("session=s%3Aabc");
 
         assert_eq!(
-            next_refresh_delay(&cookie, Duration::from_secs(12 * 60 * 60), now),
-            Duration::from_secs(12 * 60 * 60)
+            next_refresh_delay(&cookie, Duration::from_hours(12), now),
+            Duration::from_hours(12)
         );
     }
 }

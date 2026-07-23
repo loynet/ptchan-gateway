@@ -18,6 +18,10 @@ Payloads include post IDs, board/thread IDs, URLs, timestamps, public post text,
 public author labels, donor status, attachment counts, and typed
 `references` / `referenced_by` post refs.
 
+When upstream provides both rendered markup and plain `nomarkup` text, the
+gateway emits the plain text in `message` and keeps quote relationships in
+`references` / `referenced_by`.
+
 Payloads do not include raw IPs, upstream cloaks, session data, permissions,
 raw upstream JSON, file names, file hashes, or secrets.
 

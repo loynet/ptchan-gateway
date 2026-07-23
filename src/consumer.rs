@@ -1,18 +1,18 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::fmt;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WebhookEvent {
-    pub event_id: String,
-    pub kind: EventKind,
-    pub source: String,
-    pub observed_at: DateTime<Utc>,
-    pub post: Post,
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct WebhookEvent {
+    pub(crate) event_id: String,
+    pub(crate) kind: EventKind,
+    pub(crate) source: String,
+    pub(crate) observed_at: DateTime<Utc>,
+    pub(crate) post: Post,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum EventKind {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(crate) enum EventKind {
     #[serde(rename = "thread.created")]
     ThreadCreated,
     #[serde(rename = "post.created")]
@@ -20,7 +20,7 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::ThreadCreated => "thread.created",
             Self::PostCreated => "post.created",
@@ -34,52 +34,51 @@ impl fmt::Display for EventKind {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Post {
-    pub board: String,
-    pub thread_id: i64,
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct Post {
+    pub(crate) board: String,
+    pub(crate) thread_id: i64,
     #[serde(rename = "post_id")]
-    pub id: i64,
-    pub url: String,
-    pub date: DateTime<Utc>,
+    pub(crate) id: i64,
+    pub(crate) url: String,
+    pub(crate) date: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub subject: Option<String>,
+    pub(crate) subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
+    pub(crate) message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub(crate) name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tripcode: Option<String>,
+    pub(crate) tripcode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub capcode: Option<String>,
+    pub(crate) capcode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub donor: Option<bool>,
+    pub(crate) donor: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub country: Option<String>,
+    pub(crate) country: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub poster_fingerprint: Option<String>,
-    #[serde(default)]
-    pub attachment_count: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub references: Vec<PostRef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub referenced_by: Vec<PostRef>,
+    pub(crate) poster_fingerprint: Option<String>,
+    pub(crate) attachment_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) references: Vec<PostRef>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) referenced_by: Vec<PostRef>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Thread {
-    pub board: String,
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct Thread {
+    pub(crate) board: String,
     #[serde(rename = "thread_id")]
-    pub id: i64,
-    pub posts: Vec<Post>,
-    pub truncated: bool,
+    pub(crate) id: i64,
+    pub(crate) posts: Vec<Post>,
+    pub(crate) truncated: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PostRef {
-    pub board: String,
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct PostRef {
+    pub(crate) board: String,
     #[serde(rename = "thread_id")]
-    pub thread_id: i64,
+    pub(crate) thread_id: i64,
     #[serde(rename = "post_id")]
-    pub id: i64,
+    pub(crate) id: i64,
 }

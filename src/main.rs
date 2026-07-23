@@ -11,7 +11,7 @@ mod store;
 mod upstream;
 mod webhook;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, str::FromStr, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::{watch, Notify};
@@ -21,6 +21,20 @@ enum Command {
     Run,
     CheckConfig,
     CheckHealth,
+}
+
+impl FromStr for Command {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "--check-config" => Ok(Self::CheckConfig),
+            "--check-health" => Ok(Self::CheckHealth),
+            other => Err(anyhow!(
+                "unknown argument {other}; use --check-config or --check-health"
+            )),
+        }
+    }
 }
 
 #[tokio::main]
@@ -34,7 +48,6 @@ async fn main() -> Result<()> {
         Command::CheckConfig => {
             let cfg = config::Config::load_from_env().context("load config")?;
             config::init_logging(&cfg.runtime.logging)?;
-            cfg.validate().context("validate config")?;
             println!("configuration ok");
             Ok(())
         }
@@ -48,15 +61,9 @@ async fn main() -> Result<()> {
 
 fn command_from_args() -> Result<Command> {
     let mut args = std::env::args().skip(1);
-    let command = match args.next().as_deref() {
+    let command = match args.next() {
         None => Command::Run,
-        Some("--check-config") => Command::CheckConfig,
-        Some("--check-health") => Command::CheckHealth,
-        Some(other) => {
-            return Err(anyhow!(
-                "unknown argument {other}; use --check-config or --check-health"
-            ));
-        }
+        Some(command) => command.parse()?,
     };
     if args.next().is_some() {
         return Err(anyhow!("too many arguments"));
@@ -65,7 +72,6 @@ fn command_from_args() -> Result<Command> {
 }
 
 async fn run(cfg: config::Config) -> Result<()> {
-    cfg.validate().context("validate config")?;
     let cookie = config::ptchan_session_cookie().context("load ptchan session cookie")?;
     let cookie_jar = Arc::new(session::SessionCookie::new(&cookie));
     let sqlite_path = PathBuf::from(&cfg.storage.sqlite_path);

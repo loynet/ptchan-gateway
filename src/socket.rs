@@ -29,17 +29,17 @@ use crate::{
 const ROOM: &str = "globalmanage-recent-hashed";
 
 #[derive(Clone)]
-pub struct Supervisor {
-    pub cfg: PtchanConfig,
-    pub cookie: Arc<SessionCookie>,
-    pub store: Arc<Store>,
-    pub webhooks: Vec<WebhookConfig>,
-    pub fingerprint_secret: Option<String>,
-    pub delivery_wakeup: Arc<Notify>,
-    pub status: Arc<Status>,
+pub(crate) struct Supervisor {
+    pub(crate) cfg: PtchanConfig,
+    pub(crate) cookie: Arc<SessionCookie>,
+    pub(crate) store: Arc<Store>,
+    pub(crate) webhooks: Vec<WebhookConfig>,
+    pub(crate) fingerprint_secret: Option<String>,
+    pub(crate) delivery_wakeup: Arc<Notify>,
+    pub(crate) status: Arc<Status>,
 }
 
-pub async fn supervise(supervisor: Supervisor, mut shutdown: watch::Receiver<bool>) {
+pub(crate) async fn supervise(supervisor: Supervisor, mut shutdown: watch::Receiver<bool>) {
     let mut delay = supervisor.cfg.socket_reconnect_min;
     loop {
         if *shutdown.borrow() {
@@ -113,6 +113,8 @@ fn run_socket_once(supervisor: Supervisor, stop: Arc<AtomicBool>) -> Result<bool
 
     debug!(room = ROOM, base_url = %supervisor.cfg.base_url, "connecting socket");
     let client = ClientBuilder::new(supervisor.cfg.base_url.clone())
+        // Let our supervisor reconnect so each attempt gets the latest session cookie.
+        .reconnect(false)
         .transport_type(TransportType::Websocket)
         .opening_header("user-agent", supervisor.cfg.user_agent.clone())
         .opening_header("origin", origin)

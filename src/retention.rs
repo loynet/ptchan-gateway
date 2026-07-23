@@ -6,9 +6,9 @@ use tracing::{debug, info, warn};
 
 use crate::store::Store;
 
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const CLEANUP_INTERVAL: Duration = Duration::from_hours(1);
 
-pub async fn cleanup_loop(
+pub(crate) async fn cleanup_loop(
     store: Arc<Store>,
     retention: Duration,
     mut shutdown: watch::Receiver<bool>,
