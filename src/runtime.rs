@@ -19,7 +19,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::{self, IntegrationConfig, PostingConfig},
@@ -214,20 +214,36 @@ async fn integration_thread(
 ) -> impl IntoResponse {
     let started_at = Instant::now();
     let Some(integration) = authenticate_integration(&state, &headers, &method, &uri) else {
-        record_reading_request("unknown", &board, "unauthorized", started_at.elapsed());
+        reject_reading_request(
+            requested_integration_label(&state, &headers),
+            &board,
+            thread_id,
+            "unauthorized",
+            StatusCode::UNAUTHORIZED,
+            started_at,
+        );
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let integration_name = integration.name.clone();
     if !integration.reading_enabled() || !integration.board_allowed(&board) {
-        record_reading_request(&integration_name, &board, "forbidden", started_at.elapsed());
+        reject_reading_request(
+            &integration_name,
+            &board,
+            thread_id,
+            "forbidden",
+            StatusCode::FORBIDDEN,
+            started_at,
+        );
         return StatusCode::FORBIDDEN.into_response();
     }
     if let Err(rejection) = state.rate_limiters.check_reading(&integration_name) {
-        record_reading_request(
+        reject_reading_request(
             &integration_name,
             &board,
+            thread_id,
             "rate_limited",
-            started_at.elapsed(),
+            StatusCode::TOO_MANY_REQUESTS,
+            started_at,
         );
         record_gateway_rate_limited_request(
             &integration_name,
@@ -255,19 +271,35 @@ async fn integration_thread(
                 warn!(error = %err, integration = %integration_name, board, thread_id, "integration thread origin annotation failed");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
-            record_reading_request(&integration_name, &board, "success", started_at.elapsed());
+            accept_reading_request(
+                &integration_name,
+                &board,
+                thread_id,
+                "success",
+                StatusCode::OK,
+                started_at,
+            );
             Json(thread).into_response()
         }
         Ok(None) => {
-            record_reading_request(&integration_name, &board, "not_found", started_at.elapsed());
+            reject_reading_request(
+                &integration_name,
+                &board,
+                thread_id,
+                "not_found",
+                StatusCode::NOT_FOUND,
+                started_at,
+            );
             StatusCode::NOT_FOUND.into_response()
         }
         Err(err) => {
-            record_reading_request(
+            reject_reading_request(
                 &integration_name,
                 &board,
+                thread_id,
                 "upstream_error",
-                started_at.elapsed(),
+                StatusCode::BAD_GATEWAY,
+                started_at,
             );
             warn!(error = %err, integration = %integration_name, board, thread_id, "integration thread reading failed");
             StatusCode::BAD_GATEWAY.into_response()
@@ -328,11 +360,13 @@ fn reply_response(
                 board,
                 &response,
             ) {
-                record_posting_request(
+                reject_posting_request(
                     &prepared.integration_name,
                     board,
+                    thread_id,
                     "origin_tracking_unavailable",
-                    started_at.elapsed(),
+                    StatusCode::BAD_GATEWAY,
+                    started_at,
                 );
                 warn!(error = %err, integration = %prepared.integration_name, board, thread_id, post_id = response.post_id, "integration reply accepted but origin tracking failed");
                 return posting_error_response(
@@ -344,19 +378,15 @@ fn reply_response(
                     .retryable(false),
                 );
             }
-            record_posting_request(
+            accept_posting_request(
                 &prepared.integration_name,
                 board,
-                "success",
-                started_at.elapsed(),
-            );
-            debug!(
-                integration = %prepared.integration_name,
-                board,
                 thread_id,
-                post_id = response.post_id,
-                "integration reply accepted"
+                "success",
+                StatusCode::OK,
+                started_at,
             );
+            debug!(integration = %prepared.integration_name, board, thread_id, post_id = response.post_id, "integration reply accepted");
             Json(response).into_response()
         }
         Err(ReplyError::InvalidRequest(err)) => {
@@ -382,11 +412,13 @@ fn invalid_reply_response(
     err: posting::ReplyValidationError,
     started_at: Instant,
 ) -> Response {
-    record_posting_request(
+    reject_posting_request(
         &prepared.integration_name,
         board,
+        thread_id,
         err.code(),
-        started_at.elapsed(),
+        StatusCode::BAD_REQUEST,
+        started_at,
     );
     delete_pending_reply(
         &state.store,
@@ -410,11 +442,13 @@ fn upstream_reply_response(
     err: posting::UpstreamReplyError,
     started_at: Instant,
 ) -> Response {
-    record_posting_request(
+    reject_posting_request(
         &prepared.integration_name,
         board,
+        thread_id,
         err.code.as_str(),
-        started_at.elapsed(),
+        posting_status_for_upstream(err.status),
+        started_at,
     );
     delete_pending_reply(
         &state.store,
@@ -440,11 +474,13 @@ fn reply_state_unknown_response(
     started_at: Instant,
     accepted: bool,
 ) -> Response {
-    record_posting_request(
+    reject_posting_request(
         &prepared.integration_name,
         board,
+        thread_id,
         "reply_state_unknown",
-        started_at.elapsed(),
+        StatusCode::BAD_GATEWAY,
+        started_at,
     );
     if accepted {
         warn!(error = %err, integration = %prepared.integration_name, board, thread_id, "integration reply accepted but response could not be decoded");
@@ -492,21 +528,25 @@ fn prepare_reply<'a>(
     let Some(posting) =
         authenticate_posting(state, input.headers, input.method, input.uri, input.body)
     else {
-        record_posting_request(
-            "unknown",
+        reject_posting_request(
+            requested_integration_label(state, input.headers),
             input.board,
+            input.thread_id,
             "unauthorized",
-            input.started_at.elapsed(),
+            StatusCode::UNAUTHORIZED,
+            input.started_at,
         );
         return Err(Box::new(StatusCode::UNAUTHORIZED.into_response()));
     };
     let integration_name = posting.name.clone();
     if !config::board_allowed(&posting.allowed_boards, input.board) {
-        record_posting_request(
+        reject_posting_request(
             &integration_name,
             input.board,
+            input.thread_id,
             "board_not_allowed",
-            input.started_at.elapsed(),
+            StatusCode::FORBIDDEN,
+            input.started_at,
         );
         return Err(Box::new(posting_error_response(
             StatusCode::FORBIDDEN,
@@ -518,11 +558,13 @@ fn prepare_reply<'a>(
         )));
     }
     if let Err(rejection) = state.rate_limiters.check_posting(&integration_name) {
-        record_posting_request(
+        reject_posting_request(
             &integration_name,
             input.board,
+            input.thread_id,
             "rate_limited",
-            input.started_at.elapsed(),
+            StatusCode::TOO_MANY_REQUESTS,
+            input.started_at,
         );
         record_gateway_rate_limited_request(
             &integration_name,
@@ -532,12 +574,28 @@ fn prepare_reply<'a>(
         );
         return Err(Box::new(gateway_rate_limited_response()));
     }
+    let request = parse_reply_request(input, &integration_name)?;
+    let pending_id = record_pending_reply(state, input, &integration_name, &request)?;
+    Ok(PreparedReply {
+        posting,
+        integration_name,
+        request,
+        pending_id,
+    })
+}
+
+fn parse_reply_request(
+    input: &ReplyInput<'_>,
+    integration_name: &str,
+) -> std::result::Result<ReplyRequest, Box<Response>> {
     let request = serde_json::from_slice::<ReplyRequest>(input.body).map_err(|_| {
-        record_posting_request(
-            &integration_name,
+        reject_posting_request(
+            integration_name,
             input.board,
+            input.thread_id,
             "invalid_json",
-            input.started_at.elapsed(),
+            StatusCode::BAD_REQUEST,
+            input.started_at,
         );
         Box::new(posting_error_response(
             StatusCode::BAD_REQUEST,
@@ -546,32 +604,45 @@ fn prepare_reply<'a>(
         ))
     })?;
     if let Err(err) = posting::validate_reply(input.board, input.thread_id, &request.message) {
-        record_posting_request(
-            &integration_name,
+        reject_posting_request(
+            integration_name,
             input.board,
+            input.thread_id,
             err.code(),
-            input.started_at.elapsed(),
+            StatusCode::BAD_REQUEST,
+            input.started_at,
         );
         return Err(Box::new(posting_error_response(
             StatusCode::BAD_REQUEST,
             PostingErrorBody::new(err.code(), err.to_string()).retryable(false),
         )));
     }
-    let pending_id = state
+    Ok(request)
+}
+
+fn record_pending_reply(
+    state: &AppState,
+    input: &ReplyInput<'_>,
+    integration_name: &str,
+    request: &ReplyRequest,
+) -> std::result::Result<i64, Box<Response>> {
+    state
         .store
         .record_pending_produced_post(
             input.board,
             input.thread_id,
-            &integration_name,
+            integration_name,
             &request.message,
             Utc::now(),
         )
         .map_err(|err| {
-            record_posting_request(
-                &integration_name,
+            reject_posting_request(
+                integration_name,
                 input.board,
+                input.thread_id,
                 "origin_tracking_unavailable",
-                input.started_at.elapsed(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                input.started_at,
             );
             warn!(error = %err, integration = %integration_name, board = input.board, thread_id = input.thread_id, "failed to record pending produced post");
             Box::new(posting_error_response(
@@ -582,13 +653,7 @@ fn prepare_reply<'a>(
                 )
                 .retryable(true),
             ))
-        })?;
-    Ok(PreparedReply {
-        posting,
-        integration_name,
-        request,
-        pending_id,
-    })
+        })
 }
 
 fn record_accepted_reply(
@@ -698,6 +763,90 @@ fn record_posting_request(integration: &str, board: &str, result: &str, elapsed:
         .observe(elapsed.as_secs_f64());
 }
 
+fn accept_reading_request(
+    integration: &str,
+    board: &str,
+    thread_id: i64,
+    result: &str,
+    status: StatusCode,
+    started_at: Instant,
+) {
+    let elapsed = started_at.elapsed();
+    record_reading_request(integration, board, result, elapsed);
+    log_gateway_request_accepted(
+        "reading",
+        integration,
+        board,
+        thread_id,
+        result,
+        status,
+        elapsed,
+    );
+}
+
+fn reject_reading_request(
+    integration: &str,
+    board: &str,
+    thread_id: i64,
+    result: &str,
+    status: StatusCode,
+    started_at: Instant,
+) {
+    let elapsed = started_at.elapsed();
+    record_reading_request(integration, board, result, elapsed);
+    log_gateway_request_rejected(
+        "reading",
+        integration,
+        board,
+        thread_id,
+        result,
+        status,
+        elapsed,
+    );
+}
+
+fn accept_posting_request(
+    integration: &str,
+    board: &str,
+    thread_id: i64,
+    result: &str,
+    status: StatusCode,
+    started_at: Instant,
+) {
+    let elapsed = started_at.elapsed();
+    record_posting_request(integration, board, result, elapsed);
+    log_gateway_request_accepted(
+        "posting",
+        integration,
+        board,
+        thread_id,
+        result,
+        status,
+        elapsed,
+    );
+}
+
+fn reject_posting_request(
+    integration: &str,
+    board: &str,
+    thread_id: i64,
+    result: &str,
+    status: StatusCode,
+    started_at: Instant,
+) {
+    let elapsed = started_at.elapsed();
+    record_posting_request(integration, board, result, elapsed);
+    log_gateway_request_rejected(
+        "posting",
+        integration,
+        board,
+        thread_id,
+        result,
+        status,
+        elapsed,
+    );
+}
+
 fn record_gateway_rate_limited_request(
     integration: &str,
     board: &str,
@@ -710,11 +859,64 @@ fn record_gateway_rate_limited_request(
         .inc();
 }
 
+fn log_gateway_request_accepted(
+    capability: &str,
+    integration: &str,
+    board: &str,
+    thread_id: i64,
+    result: &str,
+    status: StatusCode,
+    elapsed: Duration,
+) {
+    info!(
+        integration,
+        board = metric_board(board),
+        capability,
+        thread_id,
+        result,
+        status = status.as_u16(),
+        elapsed_ms = elapsed.as_millis(),
+        "integration api request accepted"
+    );
+}
+
+fn log_gateway_request_rejected(
+    capability: &str,
+    integration: &str,
+    board: &str,
+    thread_id: i64,
+    result: &str,
+    status: StatusCode,
+    elapsed: Duration,
+) {
+    warn!(
+        integration,
+        board = metric_board(board),
+        capability,
+        thread_id,
+        result,
+        status = status.as_u16(),
+        elapsed_ms = elapsed.as_millis(),
+        "integration api request rejected"
+    );
+}
+
 fn metric_board(board: &str) -> &str {
     if config::valid_board_name(board) {
         board
     } else {
         "invalid"
+    }
+}
+
+fn requested_integration_label<'a>(state: &'a AppState, headers: &'a HeaderMap) -> &'a str {
+    let Some(name) = header(headers, "x-ptchan-integration") else {
+        return "unknown";
+    };
+    if state.integrations.contains_key(name) || state.postings.contains_key(name) {
+        name
+    } else {
+        "unknown"
     }
 }
 
