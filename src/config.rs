@@ -53,6 +53,8 @@ pub(crate) struct RuntimeConfig {
     pub(crate) http_addr: String,
     #[serde(default)]
     pub(crate) logging: LoggingConfig,
+    #[serde(default)]
+    pub(crate) rate_limit: RuntimeRateLimitConfig,
 }
 
 #[derive(Clone, Deserialize)]
@@ -69,6 +71,7 @@ impl Default for RuntimeConfig {
         Self {
             http_addr: default_http_addr(),
             logging: LoggingConfig::default(),
+            rate_limit: RuntimeRateLimitConfig::default(),
         }
     }
 }
@@ -78,6 +81,24 @@ impl Default for LoggingConfig {
         Self {
             level: default_log_level(),
             format: LogFormat::Json,
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeRateLimitConfig {
+    #[serde(default = "default_global_reading_rate_limit")]
+    pub(crate) reading: RateLimitBucketConfig,
+    #[serde(default = "default_global_posting_rate_limit")]
+    pub(crate) posting: RateLimitBucketConfig,
+}
+
+impl Default for RuntimeRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            reading: default_global_reading_rate_limit(),
+            posting: default_global_posting_rate_limit(),
         }
     }
 }
@@ -124,6 +145,8 @@ pub(crate) struct IntegrationConfig {
     pub(crate) webhook: Option<WebhookCapabilityConfig>,
     #[serde(default)]
     pub(crate) posting: Option<PostingCapabilityConfig>,
+    #[serde(default)]
+    pub(crate) rate_limit: RateLimitConfig,
     #[serde(skip)]
     pub(crate) secret: String,
 }
@@ -180,6 +203,43 @@ pub(crate) struct PostingCapabilityConfig {
         deserialize_with = "duration_from_str"
     )]
     pub(crate) timeout: Duration,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RateLimitConfig {
+    #[serde(default)]
+    pub(crate) reading: RateLimitBucketConfig,
+    #[serde(default = "default_posting_rate_limit")]
+    pub(crate) posting: RateLimitBucketConfig,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            reading: RateLimitBucketConfig::default(),
+            posting: default_posting_rate_limit(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RateLimitBucketConfig {
+    pub(crate) requests: u32,
+    #[serde(deserialize_with = "duration_from_str")]
+    pub(crate) window: Duration,
+    pub(crate) burst: u32,
+}
+
+impl Default for RateLimitBucketConfig {
+    fn default() -> Self {
+        Self {
+            requests: default_reading_rate_limit_requests(),
+            window: default_rate_limit_window(),
+            burst: default_reading_rate_limit_burst(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -348,6 +408,8 @@ impl Config {
         if self.storage.event_retention.is_zero() {
             return Err(anyhow!("storage.event_retention must be greater than zero"));
         }
+        validate_rate_limit_bucket("runtime", "reading", &self.runtime.rate_limit.reading)?;
+        validate_rate_limit_bucket("runtime", "posting", &self.runtime.rate_limit.posting)?;
         let mut names = HashSet::new();
         let mut env_names = HashSet::new();
         for integration in &self.integration {
@@ -405,6 +467,7 @@ impl Config {
             if let Some(posting) = &integration.posting {
                 validate_posting(&integration.name, posting)?;
             }
+            validate_rate_limit(&integration.name, &integration.rate_limit)?;
         }
         Ok(())
     }
@@ -476,6 +539,40 @@ fn validate_posting(integration_name: &str, posting: &PostingCapabilityConfig) -
     if name_len > POSTING_NAME_MAX_CHARS {
         return Err(anyhow!(
             "integration {integration_name} posting name is {name_len} characters; ptchan allows {POSTING_NAME_MAX_CHARS} or less"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rate_limit(integration_name: &str, rate_limit: &RateLimitConfig) -> Result<()> {
+    let owner = format!("integration {integration_name}");
+    validate_rate_limit_bucket(&owner, "reading", &rate_limit.reading)?;
+    validate_rate_limit_bucket(&owner, "posting", &rate_limit.posting)
+}
+
+fn validate_rate_limit_bucket(
+    owner: &str,
+    capability: &str,
+    rate_limit: &RateLimitBucketConfig,
+) -> Result<()> {
+    if rate_limit.requests == 0 {
+        return Err(anyhow!(
+            "{owner} rate_limit.{capability} requests must be greater than zero"
+        ));
+    }
+    if rate_limit.window.is_zero() {
+        return Err(anyhow!(
+            "{owner} rate_limit.{capability} window must be greater than zero"
+        ));
+    }
+    if rate_limit.burst == 0 || rate_limit.burst > rate_limit.requests {
+        return Err(anyhow!(
+            "{owner} rate_limit.{capability} burst must be positive and no greater than requests"
+        ));
+    }
+    if (rate_limit.window / rate_limit.requests).is_zero() {
+        return Err(anyhow!(
+            "{owner} rate_limit.{capability} window is too small for the configured request count"
         ));
     }
     Ok(())
@@ -561,6 +658,36 @@ fn default_webhook_timeout() -> Duration {
 fn default_posting_timeout() -> Duration {
     Duration::from_secs(15)
 }
+fn default_reading_rate_limit_requests() -> u32 {
+    120
+}
+fn default_rate_limit_window() -> Duration {
+    Duration::from_secs(60)
+}
+fn default_reading_rate_limit_burst() -> u32 {
+    30
+}
+fn default_posting_rate_limit() -> RateLimitBucketConfig {
+    RateLimitBucketConfig {
+        requests: 30,
+        window: default_rate_limit_window(),
+        burst: 5,
+    }
+}
+fn default_global_reading_rate_limit() -> RateLimitBucketConfig {
+    RateLimitBucketConfig {
+        requests: 1_000,
+        window: default_rate_limit_window(),
+        burst: 200,
+    }
+}
+fn default_global_posting_rate_limit() -> RateLimitBucketConfig {
+    RateLimitBucketConfig {
+        requests: 100,
+        window: default_rate_limit_window(),
+        burst: 20,
+    }
+}
 fn default_event_retention() -> Duration {
     Duration::from_hours(14 * 24)
 }
@@ -624,6 +751,40 @@ mod tests {
     }
 
     #[test]
+    fn validates_integration_rate_limit() {
+        let mut cfg = valid_config();
+        cfg.integration[0].rate_limit.reading.burst = 0;
+
+        let err = cfg.validate().unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("integration example rate_limit.reading burst"));
+
+        cfg.integration[0].rate_limit.reading.burst =
+            cfg.integration[0].rate_limit.reading.requests + 1;
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("integration example rate_limit.reading burst"));
+
+        cfg.integration[0].rate_limit.reading.burst = 1;
+        cfg.integration[0].rate_limit.reading.requests = 2_000_000_000;
+        cfg.integration[0].rate_limit.reading.window = Duration::from_secs(1);
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("integration example rate_limit.reading window is too small"));
+
+        let mut cfg = valid_config();
+        cfg.integration[0].rate_limit.posting.burst = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("integration example rate_limit.posting burst"));
+    }
+
+    #[test]
     fn validates_integration_names_for_env_and_metrics() {
         let mut cfg = valid_config();
         cfg.integration[0].name = "bad name".to_string();
@@ -644,6 +805,7 @@ mod tests {
             reading: Some(ReadingCapabilityConfig {}),
             webhook: None,
             posting: None,
+            rate_limit: RateLimitConfig::default(),
             secret: String::new(),
         });
         cfg.integration[0].name = "example_test".to_string();
@@ -683,6 +845,10 @@ sqlite_path = "data/test.db"
         assert_eq!(cfg.runtime.http_addr, "0.0.0.0:8080");
         assert_eq!(cfg.runtime.logging.level, "info");
         assert!(matches!(cfg.runtime.logging.format, LogFormat::Json));
+        assert_eq!(cfg.runtime.rate_limit.reading.requests, 1_000);
+        assert_eq!(cfg.runtime.rate_limit.reading.burst, 200);
+        assert_eq!(cfg.runtime.rate_limit.posting.requests, 100);
+        assert_eq!(cfg.runtime.rate_limit.posting.burst, 20);
     }
 
     #[test]
@@ -703,6 +869,18 @@ sqlite_path = "data/test.db"
         let cfg = toml::from_str::<Config>(raw).unwrap();
 
         assert!(cfg.integration[0].reading_enabled());
+        assert_eq!(cfg.integration[0].rate_limit.reading.requests, 120);
+        assert_eq!(
+            cfg.integration[0].rate_limit.reading.window,
+            Duration::from_secs(60)
+        );
+        assert_eq!(cfg.integration[0].rate_limit.reading.burst, 30);
+        assert_eq!(cfg.integration[0].rate_limit.posting.requests, 30);
+        assert_eq!(
+            cfg.integration[0].rate_limit.posting.window,
+            Duration::from_secs(60)
+        );
+        assert_eq!(cfg.integration[0].rate_limit.posting.burst, 5);
         assert!(toml::from_str::<Config>(
             r#"
 [ptchan]
@@ -736,6 +914,7 @@ sqlite_path = "data/test.db"
                     level: "info".to_string(),
                     format: LogFormat::Json,
                 },
+                rate_limit: RuntimeRateLimitConfig::default(),
             },
             storage: StorageConfig {
                 sqlite_path: "data/test.db".to_string(),
@@ -751,6 +930,7 @@ sqlite_path = "data/test.db"
                     timeout: Duration::from_secs(10),
                 }),
                 posting: None,
+                rate_limit: RateLimitConfig::default(),
                 secret: String::new(),
             }],
             webhook: Vec::new(),

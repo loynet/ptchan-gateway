@@ -25,6 +25,7 @@ use crate::{
     config::{self, IntegrationConfig, PostingConfig},
     metrics,
     posting::{self, PostWriter, ReplyError, ReplyRequest},
+    rate_limit::RateLimiters,
     reading::{ThreadReader, DEFAULT_THREAD_LIMIT},
     store::Store,
 };
@@ -93,6 +94,7 @@ struct AppState {
     post_writer: PostWriter,
     integrations: Arc<HashMap<String, IntegrationConfig>>,
     postings: Arc<HashMap<String, PostingConfig>>,
+    rate_limiters: RateLimiters,
 }
 
 pub(crate) async fn spawn_http(
@@ -105,6 +107,7 @@ pub(crate) async fn spawn_http(
         .context("bind runtime http")?;
     let local_addr = listener.local_addr().context("runtime local addr")?;
     tracing::info!(address = %local_addr, "runtime http listening");
+    let rate_limiters = RateLimiters::new(&server.integrations, &server.rate_limit)?;
     let app = router(AppState {
         status: server.status,
         store: server.store,
@@ -124,6 +127,7 @@ pub(crate) async fn spawn_http(
                 .map(|posting| (posting.name.clone(), posting))
                 .collect(),
         ),
+        rate_limiters,
     });
     Ok(tokio::spawn(async move {
         axum::serve(listener, app)
@@ -143,6 +147,7 @@ pub(crate) struct HttpServer {
     pub(crate) post_writer: PostWriter,
     pub(crate) integrations: Vec<IntegrationConfig>,
     pub(crate) postings: Vec<PostingConfig>,
+    pub(crate) rate_limit: config::RuntimeRateLimitConfig,
 }
 
 fn router(state: AppState) -> Router {
@@ -216,6 +221,21 @@ async fn integration_thread(
     if !integration.reading_enabled() || !integration.board_allowed(&board) {
         record_reading_request(&integration_name, &board, "forbidden", started_at.elapsed());
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Err(rejection) = state.rate_limiters.check_reading(&integration_name) {
+        record_reading_request(
+            &integration_name,
+            &board,
+            "rate_limited",
+            started_at.elapsed(),
+        );
+        record_gateway_rate_limited_request(
+            &integration_name,
+            &board,
+            "reading",
+            rejection.as_str(),
+        );
+        return gateway_rate_limited_response();
     }
 
     let limit = query.limit.unwrap_or(DEFAULT_THREAD_LIMIT);
@@ -497,6 +517,21 @@ fn prepare_reply<'a>(
             .retryable(false),
         )));
     }
+    if let Err(rejection) = state.rate_limiters.check_posting(&integration_name) {
+        record_posting_request(
+            &integration_name,
+            input.board,
+            "rate_limited",
+            input.started_at.elapsed(),
+        );
+        record_gateway_rate_limited_request(
+            &integration_name,
+            input.board,
+            "posting",
+            rejection.as_str(),
+        );
+        return Err(Box::new(gateway_rate_limited_response()));
+    }
     let request = serde_json::from_slice::<ReplyRequest>(input.body).map_err(|_| {
         record_posting_request(
             &integration_name,
@@ -636,6 +671,13 @@ fn posting_status_for_upstream(status: StatusCode) -> StatusCode {
     }
 }
 
+fn gateway_rate_limited_response() -> Response {
+    posting_error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        PostingErrorBody::new("rate_limited", "gateway rate limit exceeded").retryable(true),
+    )
+}
+
 fn record_reading_request(integration: &str, board: &str, result: &str, elapsed: Duration) {
     let board = metric_board(board);
     metrics::READING_REQUESTS
@@ -654,6 +696,18 @@ fn record_posting_request(integration: &str, board: &str, result: &str, elapsed:
     metrics::POSTING_REQUEST_SECONDS
         .with_label_values(&[integration, board, result])
         .observe(elapsed.as_secs_f64());
+}
+
+fn record_gateway_rate_limited_request(
+    integration: &str,
+    board: &str,
+    capability: &str,
+    scope: &str,
+) {
+    let board = metric_board(board);
+    metrics::GATEWAY_RATE_LIMITED_REQUESTS
+        .with_label_values(&[integration, board, capability, scope])
+        .inc();
 }
 
 fn metric_board(board: &str) -> &str {
@@ -759,12 +813,18 @@ pub(crate) async fn check_health(addr: &str) -> Result<()> {
 mod tests {
     use std::{collections::HashMap, sync::Arc, time::Duration};
 
+    use axum::body::to_bytes;
     use hmac::Mac;
+    use serde_json::Value;
 
-    use super::{router, verify_request_signature, AppState, HmacSha256, Method, Status, Uri};
+    use super::{
+        router, verify_request_signature, AppState, HmacSha256, Method, Status, StatusCode, Uri,
+    };
     use crate::{
         config::{IntegrationConfig, PtchanConfig, ReadingCapabilityConfig},
+        metrics,
         posting::PostWriter,
+        rate_limit::RateLimiters,
         reading::ThreadReader,
         store::Store,
     };
@@ -816,6 +876,11 @@ mod tests {
             post_writer,
             integrations: Arc::new(HashMap::new()),
             postings: Arc::new(HashMap::new()),
+            rate_limiters: RateLimiters::new(
+                &[],
+                &crate::config::RuntimeRateLimitConfig::default(),
+            )
+            .unwrap(),
         });
     }
 
@@ -850,6 +915,37 @@ mod tests {
         .is_err());
     }
 
+    #[tokio::test]
+    async fn gateway_rate_limit_response_is_structured_for_integrations() {
+        let response = super::gateway_rate_limited_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(body["error"]["code"], "rate_limited");
+        assert_eq!(body["error"]["message"], "gateway rate limit exceeded");
+        assert_eq!(body["error"]["retryable"], true);
+        assert!(body["error"].get("upstream_status").is_none());
+    }
+
+    #[test]
+    fn gateway_rate_limit_metric_sanitizes_board_label() {
+        metrics::init();
+
+        super::record_gateway_rate_limited_request(
+            "assistant",
+            "bad/board",
+            "reading",
+            "integration",
+        );
+
+        let rendered = metrics::render().unwrap();
+        assert!(rendered.contains(
+            r#"ptchan_gateway_rate_limited_requests_total{board="invalid",capability="reading",integration="assistant",scope="integration"}"#
+        ));
+        assert!(!rendered.contains(r#"board="bad/board""#));
+    }
+
     #[test]
     fn integration_reading_capability_is_explicit() {
         let integration = IntegrationConfig {
@@ -858,6 +954,7 @@ mod tests {
             reading: Some(ReadingCapabilityConfig {}),
             webhook: None,
             posting: None,
+            rate_limit: crate::config::RateLimitConfig::default(),
             secret: "secret".to_string(),
         };
 

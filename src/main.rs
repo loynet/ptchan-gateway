@@ -3,6 +3,7 @@ mod contract;
 mod event;
 mod metrics;
 mod posting;
+mod rate_limit;
 mod reading;
 mod retention;
 mod runtime;
@@ -93,6 +94,7 @@ async fn run(cfg: config::Config) -> Result<()> {
             post_writer,
             integrations: cfg.integration.clone(),
             postings: cfg.posting.clone(),
+            rate_limit: cfg.runtime.rate_limit.clone(),
         },
         shutdown_rx.clone(),
     )

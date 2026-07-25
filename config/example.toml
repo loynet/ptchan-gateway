@@ -13,6 +13,18 @@ name = "example"
 # This applies to reading, webhook delivery, and posting.
 allowed_boards = []
 
+# Signed API rate limits for this integration.
+# Buckets refill requests evenly over the window and allow short bursts.
+[integration.rate_limit.reading]
+requests = 120
+window = "60s"
+burst = 30
+
+[integration.rate_limit.posting]
+requests = 30
+window = "60s"
+burst = 5
+
 # Enable signed thread reads by including this section.
 # Omit the section to disable reading for this integration.
 [integration.reading]
@@ -41,6 +53,16 @@ timeout = "15s"
 
 [runtime]
 http_addr = "0.0.0.0:8080"
+
+[runtime.rate_limit.reading]
+requests = 1000
+window = "60s"
+burst = 200
+
+[runtime.rate_limit.posting]
+requests = 100
+window = "60s"
+burst = 20
 
 [runtime.logging]
 level = "info"

@@ -43,6 +43,39 @@ environment variable names, metrics, and `origin` fields.
 `allowed_boards = []` means all boards. Otherwise the integration is limited to
 the listed boards for every enabled capability.
 
+Each integration also has signed API rate limits for reading and posting. By
+default the gateway allows 120 reads per 60 seconds with a burst of 30, and 30
+posts per 60 seconds with a burst of 5. Override them with
+`[integration.rate_limit.reading]` and `[integration.rate_limit.posting]`:
+
+```toml
+[integration.rate_limit.reading]
+requests = 120
+window = "60s"
+burst = 30
+
+[integration.rate_limit.posting]
+requests = 30
+window = "60s"
+burst = 5
+```
+
+The runtime also has global reading and posting rate limits across all
+integrations. Defaults are intentionally higher: 1,000 reads per 60 seconds
+with a burst of 200, and 100 posts per 60 seconds with a burst of 20.
+
+```toml
+[runtime.rate_limit.reading]
+requests = 1000
+window = "60s"
+burst = 200
+
+[runtime.rate_limit.posting]
+requests = 100
+window = "60s"
+burst = 20
+```
+
 Capabilities are enabled by including their section and disabled by omitting it.
 For example, omit `[integration.posting]` to reject signed posting requests for
 that integration. Omit `[integration.webhook]` to skip webhook delivery; if no
@@ -55,6 +88,16 @@ Example:
 [[integration]]
 name = "example"
 allowed_boards = ["test"]
+
+[integration.rate_limit.reading]
+requests = 120
+window = "60s"
+burst = 30
+
+[integration.rate_limit.posting]
+requests = 30
+window = "60s"
+burst = 5
 
 [integration.reading]
 
@@ -152,6 +195,19 @@ GET /integration/v1/threads/test/397?limit=50
 The response is a sanitized thread with posts in chronological order. `limit`
 defaults to `50` and is capped at `200`.
 
+Gateway-side read rate limits return `429` with the same error envelope used by
+posting errors:
+
+```json
+{
+  "error": {
+    "code": "rate_limited",
+    "message": "gateway rate limit exceeded",
+    "retryable": true
+  }
+}
+```
+
 When a post was created through the gateway, its `origin` identifies the
 integration:
 
@@ -228,6 +284,10 @@ Errors return a stable code and retry hint:
 }
 ```
 
+Gateway-side rate limits use the same `rate_limited` code with the message
+`gateway rate limit exceeded` and no `upstream_status`. Upstream ptchan rate
+limits include `upstream_status`.
+
 Known reply error codes include `invalid_json`, `invalid_board`,
 `invalid_thread_id`, `missing_message`, `message_too_long`, `invalid_message`,
 `board_not_allowed`, `captcha_required`, `block_bypass_required`,
@@ -256,6 +316,9 @@ File uploads and new thread creation are not part of the current write surface.
 - Integration API usage and latency: `ptchan_reading_requests_total`,
   `ptchan_reading_request_seconds`, `ptchan_posting_requests_total`, and
   `ptchan_posting_request_seconds`, labeled by integration, board, and result.
+  Gateway-enforced rate limits also increment
+  `ptchan_gateway_rate_limited_requests_total`, labeled by integration, board,
+  capability, and scope (`integration` or `global`).
 - Storage health: `ptchan_sqlite_errors_total`.
 - Gateway process health on Linux/container deployments:
   `process_cpu_seconds_total`, `process_resident_memory_bytes`,

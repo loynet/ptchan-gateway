@@ -118,6 +118,14 @@ pub(crate) static POSTING_REQUEST_SECONDS: LazyLock<HistogramVec> = LazyLock::ne
     )
     .unwrap()
 });
+pub(crate) static GATEWAY_RATE_LIMITED_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    prometheus::register_int_counter_vec!(
+        "ptchan_gateway_rate_limited_requests_total",
+        "Integration API requests rate limited by the gateway",
+        &["integration", "board", "capability", "scope"]
+    )
+    .unwrap()
+});
 pub(crate) static SQLITE_ERRORS: LazyLock<IntCounter> = LazyLock::new(|| {
     prometheus::register_int_counter!("ptchan_sqlite_errors_total", "SQLite operation failures")
         .unwrap()
@@ -146,6 +154,7 @@ pub(crate) fn init() {
     LazyLock::force(&READING_REQUEST_SECONDS);
     LazyLock::force(&POSTING_REQUESTS);
     LazyLock::force(&POSTING_REQUEST_SECONDS);
+    LazyLock::force(&GATEWAY_RATE_LIMITED_REQUESTS);
     LazyLock::force(&SQLITE_ERRORS);
     LazyLock::force(&REDACTION_DROPS);
 }
