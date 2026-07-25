@@ -130,7 +130,7 @@ pub(crate) struct IntegrationConfig {
 
 impl IntegrationConfig {
     pub(crate) fn reading_enabled(&self) -> bool {
-        self.reading.as_ref().is_some_and(|reading| reading.enabled)
+        self.reading.is_some()
     }
 
     pub(crate) fn board_allowed(&self, board: &str) -> bool {
@@ -147,10 +147,7 @@ pub(crate) fn board_allowed(allowed_boards: &[String], board: &str) -> bool {
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ReadingCapabilityConfig {
-    #[serde(default = "default_enabled")]
-    pub(crate) enabled: bool,
-}
+pub(crate) struct ReadingCapabilityConfig {}
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,8 +169,6 @@ pub(crate) struct PostingCapabilityConfig {
     pub(crate) display_name: Option<String>,
     #[serde(default)]
     pub(crate) use_tripcode: bool,
-    #[serde(default = "default_secure_tripcode")]
-    pub(crate) secure_tripcode: bool,
     #[serde(default)]
     pub(crate) use_post_password: bool,
     #[serde(skip)]
@@ -202,7 +197,6 @@ pub(crate) struct PostingConfig {
     pub(crate) name: String,
     pub(crate) allowed_boards: Vec<String>,
     pub(crate) display_name: Option<String>,
-    pub(crate) secure_tripcode: bool,
     pub(crate) secret: String,
     pub(crate) tripcode: Option<String>,
     pub(crate) post_password: Option<String>,
@@ -314,7 +308,6 @@ impl Config {
                     name: integration.name.clone(),
                     allowed_boards: integration.allowed_boards.clone(),
                     display_name: posting.display_name.clone(),
-                    secure_tripcode: posting.secure_tripcode,
                     secret: integration.secret.clone(),
                     tripcode: posting.tripcode.clone(),
                     post_password: posting.post_password.clone(),
@@ -395,14 +388,6 @@ impl Config {
                     ));
                 }
             }
-            if let Some(reading) = &integration.reading {
-                if !reading.enabled {
-                    return Err(anyhow!(
-                        "integration {} reading.enabled must be true or the reading section must be omitted",
-                        integration.name
-                    ));
-                }
-            }
             if let Some(webhook) = &integration.webhook {
                 reqwest::Url::parse(&webhook.url).with_context(|| {
                     format!(
@@ -467,8 +452,7 @@ fn posting_form_name(integration_name: &str, posting: &PostingCapabilityConfig) 
         .unwrap_or(integration_name)
         .trim();
     match posting.tripcode.as_deref() {
-        Some(tripcode) if posting.secure_tripcode => Some(format!("{name}##{tripcode}")),
-        Some(tripcode) => Some(format!("{name}#{tripcode}")),
+        Some(tripcode) => Some(format!("{name}##{tripcode}")),
         None if name.is_empty() => None,
         None => Some(name.to_string()),
     }
@@ -577,12 +561,6 @@ fn default_webhook_timeout() -> Duration {
 fn default_posting_timeout() -> Duration {
     Duration::from_secs(15)
 }
-const fn default_enabled() -> bool {
-    true
-}
-const fn default_secure_tripcode() -> bool {
-    true
-}
 fn default_event_retention() -> Duration {
     Duration::from_hours(14 * 24)
 }
@@ -632,7 +610,6 @@ mod tests {
         cfg.integration[0].posting = Some(PostingCapabilityConfig {
             display_name: Some("ptchan-gateway".to_string()),
             use_tripcode: true,
-            secure_tripcode: true,
             use_post_password: false,
             tripcode: Some("this-is-an-example-ok".to_string()),
             post_password: None,
@@ -664,7 +641,7 @@ mod tests {
         cfg.integration.push(IntegrationConfig {
             name: "example-test".to_string(),
             allowed_boards: Vec::new(),
-            reading: Some(ReadingCapabilityConfig { enabled: true }),
+            reading: Some(ReadingCapabilityConfig {}),
             webhook: None,
             posting: None,
             secret: String::new(),
@@ -708,6 +685,42 @@ sqlite_path = "data/test.db"
         assert!(matches!(cfg.runtime.logging.format, LogFormat::Json));
     }
 
+    #[test]
+    fn reading_capability_is_enabled_by_section_presence() {
+        let raw = r#"
+[ptchan]
+base_url = "https://ptchan.test"
+
+[[integration]]
+name = "example"
+
+[integration.reading]
+
+[storage]
+sqlite_path = "data/test.db"
+"#;
+
+        let cfg = toml::from_str::<Config>(raw).unwrap();
+
+        assert!(cfg.integration[0].reading_enabled());
+        assert!(toml::from_str::<Config>(
+            r#"
+[ptchan]
+base_url = "https://ptchan.test"
+
+[[integration]]
+name = "example"
+
+[integration.reading]
+enabled = true
+
+[storage]
+sqlite_path = "data/test.db"
+"#
+        )
+        .is_err());
+    }
+
     fn valid_config() -> Config {
         Config {
             ptchan: PtchanConfig {
@@ -731,7 +744,7 @@ sqlite_path = "data/test.db"
             integration: vec![IntegrationConfig {
                 name: "example".to_string(),
                 allowed_boards: Vec::new(),
-                reading: Some(ReadingCapabilityConfig { enabled: true }),
+                reading: Some(ReadingCapabilityConfig {}),
                 webhook: Some(WebhookCapabilityConfig {
                     url: "http://127.0.0.1:8081/events".to_string(),
                     include_poster_fingerprint: false,

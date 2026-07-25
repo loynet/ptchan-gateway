@@ -43,15 +43,20 @@ environment variable names, metrics, and `origin` fields.
 `allowed_boards = []` means all boards. Otherwise the integration is limited to
 the listed boards for every enabled capability.
 
+Capabilities are enabled by including their section and disabled by omitting it.
+For example, omit `[integration.posting]` to reject signed posting requests for
+that integration. Omit `[integration.webhook]` to skip webhook delivery; if no
+webhooks are configured, the gateway does not start the management session or
+Socket.IO client.
+
 Example:
 
 ```toml
 [[integration]]
 name = "example"
-allowed_boards = ["cc99"]
+allowed_boards = ["test"]
 
 [integration.reading]
-enabled = true
 
 [integration.webhook]
 url = "http://127.0.0.1:8081/internal/ptchan/events"
@@ -60,7 +65,6 @@ include_poster_fingerprint = false
 [integration.posting]
 display_name = "gw"
 use_tripcode = true
-secure_tripcode = true
 use_post_password = true
 timeout = "15s"
 ```
@@ -84,7 +88,7 @@ Reading and posting do not use that cookie.
 
 ```bash
 cp .env.example .env.dev
-cp config.example.toml config/dev.toml
+cp config/example.toml config/dev.toml
 make tools
 make run
 ```
@@ -103,8 +107,8 @@ The development client reads `.env.dev` automatically:
 
 ```bash
 cargo run --example gateway_client -- health
-cargo run --example gateway_client -- read cc99 397 --limit 50
-printf 'hello from gateway\n' | cargo run --example gateway_client -- post cc99 397 --stdin
+cargo run --example gateway_client -- read test 397 --limit 50
+printf 'hello from gateway\n' | cargo run --example gateway_client -- post test 397 --stdin
 cargo run --example gateway_client -- listen --read-after-receive
 ```
 
@@ -142,7 +146,7 @@ The signed message for posting replies is:
 ## Thread Reads
 
 ```http
-GET /integration/v1/threads/cc99/397?limit=50
+GET /integration/v1/threads/test/397?limit=50
 ```
 
 The response is a sanitized thread with posts in chronological order. `limit`
@@ -191,7 +195,7 @@ Webhook signatures are HMAC-SHA256 over:
 ## Posting Replies
 
 ```http
-POST /integration/v1/threads/cc99/397/replies
+POST /integration/v1/threads/test/397/replies
 content-type: application/json
 ```
 
@@ -203,10 +207,10 @@ Successful replies return post coordinates:
 
 ```json
 {
-  "board": "cc99",
+  "board": "test",
   "thread_id": 397,
   "post_id": 406,
-  "url": "https://ptchan.org/cc99/thread/397.html#406",
+  "url": "https://ptchan.org/test/thread/397.html#406",
   "origin": { "kind": "integration", "name": "example" }
 }
 ```
@@ -268,5 +272,42 @@ make docker-deploy GATEWAY_ENV=prod DOCKER_NETWORK=integration-net
 make docker-logs GATEWAY_ENV=prod
 ```
 
-`DOCKER_NETWORK` is optional and should name an existing Docker network when
-integrations are addressed by container name.
+Docker images are tagged with the current commit by default, for example
+`ptchan-gateway:abc1234`. Override `IMAGE` when pushing to a registry or using a
+specific tag:
+
+```bash
+make docker-deploy GATEWAY_ENV=prod IMAGE=registry.example/ptchan-gateway:abc1234
+```
+
+`GATEWAY_ENV` selects the environment-specific inputs and resource names:
+
+```text
+GATEWAY_ENV=dev   -> .env.dev,  config/dev.toml,  ptchan-gateway-dev,  ptchan-gateway-dev-data
+GATEWAY_ENV=prod  -> .env.prod, config/prod.toml, ptchan-gateway-prod, ptchan-gateway-prod-data
+```
+
+Inside the container, the selected config is mounted read-only at
+`/etc/ptchan-gateway/config.toml` and SQLite is stored at
+`/data/ptchan-gateway.db` on the named Docker volume. `docker-deploy` replaces
+the container but keeps the volume.
+
+Dev and prod can run on the same host at the same time. They see the same
+SQLite path inside their containers, but that path is backed by different named
+volumes:
+
+```text
+ptchan-gateway-dev   -> /data/ptchan-gateway.db on ptchan-gateway-dev-data
+ptchan-gateway-prod  -> /data/ptchan-gateway.db on ptchan-gateway-prod-data
+```
+
+Logs go to stdout/stderr and are captured by Docker:
+
+```bash
+docker logs -f ptchan-gateway-prod
+```
+
+`DOCKER_NETWORK` should name an existing Docker network when integrations are
+addressed by container name. The Makefile does not publish host ports by
+default; on a shared Docker network, integrations can reach the gateway by
+container name, such as `http://ptchan-gateway-prod:8080`.

@@ -855,7 +855,7 @@ mod tests {
         let integration = IntegrationConfig {
             name: "assistant".to_string(),
             allowed_boards: vec!["test".to_string()],
-            reading: Some(ReadingCapabilityConfig { enabled: true }),
+            reading: Some(ReadingCapabilityConfig {}),
             webhook: None,
             posting: None,
             secret: "secret".to_string(),

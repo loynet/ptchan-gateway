@@ -17,6 +17,7 @@
 
 # Local config
 /config/*.toml
+!/config/example.toml
 
 # Editor and OS state
 /.vscode/

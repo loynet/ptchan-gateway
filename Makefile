@@ -1,5 +1,6 @@
 BINARY ?= ptchan-gateway
-IMAGE ?= ptchan-gateway:local
+IMAGE_TAG ?= $(shell git rev-parse --short HEAD 2>/dev/null || printf local)
+IMAGE ?= ptchan-gateway:$(IMAGE_TAG)
 GATEWAY_ENV ?= dev
 ENV_FILE ?= .env.$(GATEWAY_ENV)
 CONFIG_FILE ?= config/$(GATEWAY_ENV).toml

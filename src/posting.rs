@@ -365,8 +365,7 @@ fn posting_name(posting: &PostingConfig) -> Option<String> {
         .unwrap_or(&posting.name)
         .trim();
     match posting.tripcode.as_deref() {
-        Some(tripcode) if posting.secure_tripcode => Some(format!("{name}##{tripcode}")),
-        Some(tripcode) => Some(format!("{name}#{tripcode}")),
+        Some(tripcode) => Some(format!("{name}##{tripcode}")),
         None if name.is_empty() => None,
         None => Some(name.to_string()),
     }
@@ -411,7 +410,6 @@ mod tests {
             name: "agent".to_string(),
             allowed_boards: vec!["i".to_string()],
             display_name: Some("Agent".to_string()),
-            secure_tripcode: true,
             secret: "integration-secret".to_string(),
             tripcode: Some("trip-secret".to_string()),
             post_password: Some("post-secret".to_string()),
@@ -442,12 +440,12 @@ mod tests {
     #[test]
     fn builds_public_posting_and_thread_urls() {
         assert_eq!(
-            posting_url("https://ptchan.org/", "cc99"),
-            "https://ptchan.org/forms/board/cc99/post"
+            posting_url("https://ptchan.org/", "test"),
+            "https://ptchan.org/forms/board/test/post"
         );
         assert_eq!(
-            thread_url("https://ptchan.org/", "cc99", 397),
-            "https://ptchan.org/cc99/thread/397.html"
+            thread_url("https://ptchan.org/", "test", 397),
+            "https://ptchan.org/test/thread/397.html"
         );
     }
 
@@ -457,7 +455,6 @@ mod tests {
             name: "agent".to_string(),
             allowed_boards: vec!["i".to_string()],
             display_name: Some("Agent".to_string()),
-            secure_tripcode: true,
             secret: "integration-secret".to_string(),
             tripcode: Some("trip-secret".to_string()),
             post_password: None,
@@ -468,22 +465,6 @@ mod tests {
             posting_name(&posting).as_deref(),
             Some("Agent##trip-secret")
         );
-    }
-
-    #[test]
-    fn can_build_legacy_tripcode_name() {
-        let posting = PostingConfig {
-            name: "agent".to_string(),
-            allowed_boards: vec!["i".to_string()],
-            display_name: Some("Agent".to_string()),
-            secure_tripcode: false,
-            secret: "integration-secret".to_string(),
-            tripcode: Some("trip-secret".to_string()),
-            post_password: None,
-            timeout: Duration::from_secs(15),
-        };
-
-        assert_eq!(posting_name(&posting).as_deref(), Some("Agent#trip-secret"));
     }
 
     #[test]
