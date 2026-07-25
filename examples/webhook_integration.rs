@@ -17,19 +17,19 @@ use sha2::Sha256;
 use tracing::{debug, info, warn};
 
 type HmacSha256 = Hmac<Sha256>;
-const DEFAULT_CONTEXT_LIMIT: usize = 50;
+const DEFAULT_READING_LIMIT: usize = 50;
 
 #[derive(Clone)]
 struct AppState {
-    webhook_secret: String,
+    integration_secret: String,
     log_body: bool,
-    context: Option<ContextClient>,
+    reading: Option<ReadingClient>,
 }
 
 #[derive(Clone)]
-struct ContextClient {
+struct ReadingClient {
     base_url: String,
-    consumer: String,
+    integration: String,
     secret: String,
     limit: usize,
     client: Client,
@@ -39,31 +39,32 @@ struct ContextClient {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            env::var("RUST_LOG").unwrap_or_else(|_| "webhook_consumer=info,tower_http=warn".into()),
+            env::var("RUST_LOG")
+                .unwrap_or_else(|_| "webhook_integration=info,tower_http=warn".into()),
         )
         .init();
 
-    let addr = env::var("CONSUMER_ADDR")
+    let addr = env::var("INTEGRATION_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8081".into())
         .parse::<SocketAddr>()
-        .context("parse CONSUMER_ADDR")?;
-    let webhook_secret =
-        env::var("PTCHAN_CONSUMER_SECRET").context("PTCHAN_CONSUMER_SECRET is unset")?;
-    let log_body = env_flag("CONSUMER_LOG_BODY");
-    let context = context_client(&webhook_secret);
-    let context_enabled = context.is_some();
+        .context("parse INTEGRATION_ADDR")?;
+    let integration_secret =
+        env::var("PTCHAN_INTEGRATION_SECRET").context("PTCHAN_INTEGRATION_SECRET is unset")?;
+    let log_body = env_flag("INTEGRATION_LOG_BODY");
+    let reading = reading_client(&integration_secret);
+    let reading_enabled = reading.is_some();
 
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/internal/ptchan/events", post(handle_event))
         .with_state(AppState {
-            webhook_secret,
+            integration_secret,
             log_body,
-            context,
+            reading,
         });
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(%addr, log_body, context_enabled, "example consumer listening");
+    info!(%addr, log_body, reading_enabled, "example integration listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -74,7 +75,7 @@ async fn handle_event(
     body: Bytes,
 ) -> impl IntoResponse {
     debug!(headers = %safe_header_summary(&headers), body_bytes = body.len(), "webhook request received");
-    match verify_request(&state.webhook_secret, &headers, &body) {
+    match verify_request(&state.integration_secret, &headers, &body) {
         Ok(VerifiedRequest {
             event_id,
             timestamp,
@@ -117,12 +118,12 @@ async fn handle_event(
                 if state.log_body {
                     debug!(body = %String::from_utf8_lossy(&body), "accepted sanitized body");
                 }
-                if let Some(context) = &state.context {
+                if let Some(reading) = &state.reading {
                     if let Some(thread_id) =
                         event.pointer("/post/thread_id").and_then(Value::as_i64)
                     {
-                        if let Err(err) = context.fetch_thread(board, thread_id).await {
-                            warn!(error = %err, board, thread_id, "thread context fetch failed");
+                        if let Err(err) = reading.fetch_thread(board, thread_id).await {
+                            warn!(error = %err, board, thread_id, "thread reading fetch failed");
                         }
                     }
                 }
@@ -140,43 +141,43 @@ async fn handle_event(
     }
 }
 
-impl ContextClient {
+impl ReadingClient {
     async fn fetch_thread(&self, board: &str, thread_id: i64) -> Result<()> {
         let path = format!(
-            "/consumer/v1/threads/{board}/{thread_id}?limit={}",
+            "/integration/v1/threads/{board}/{thread_id}?limit={}",
             self.limit
         );
         let timestamp = Utc::now().to_rfc3339();
-        let signature = context_signature(&self.secret, &timestamp, "GET", &path)?;
+        let signature = reading_signature(&self.secret, &timestamp, "GET", &path)?;
         let url = format!("{}{}", self.base_url, path);
         let response = self
             .client
             .get(url)
-            .header("x-ptchan-consumer", &self.consumer)
+            .header("x-ptchan-integration", &self.integration)
             .header("x-ptchan-timestamp", &timestamp)
             .header("x-ptchan-signature", signature)
             .send()
             .await
-            .context("send context request")?;
+            .context("send reading request")?;
         let status = response.status();
         if !status.is_success() {
-            return Err(anyhow!("context status {status}"));
+            return Err(anyhow!("reading status {status}"));
         }
-        let body = response.text().await.context("read context response")?;
-        let context = serde_json::from_str::<Value>(&body).context("decode context response")?;
-        let posts = context
+        let body = response.text().await.context("read reading response")?;
+        let thread = serde_json::from_str::<Value>(&body).context("decode reading response")?;
+        let posts = thread
             .pointer("/posts")
             .and_then(Value::as_array)
             .map_or(0, Vec::len);
-        let truncated = context
+        let truncated = thread
             .pointer("/truncated")
             .and_then(Value::as_bool)
             .unwrap_or(false);
         info!(
             board,
-            thread_id, posts, truncated, "thread context accepted"
+            thread_id, posts, truncated, "thread reading accepted"
         );
-        debug!(body_bytes = body.len(), "thread context response received");
+        debug!(body_bytes = body.len(), "thread reading response received");
         Ok(())
     }
 }
@@ -212,7 +213,7 @@ fn verify_request(secret: &str, headers: &HeaderMap, body: &[u8]) -> Result<Veri
     })
 }
 
-fn context_signature(secret: &str, timestamp: &str, method: &str, path: &str) -> Result<String> {
+fn reading_signature(secret: &str, timestamp: &str, method: &str, path: &str) -> Result<String> {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).context("create hmac")?;
     mac.update(timestamp.as_bytes());
     mac.update(b".");
@@ -246,17 +247,17 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn context_client(webhook_secret: &str) -> Option<ContextClient> {
+fn reading_client(integration_secret: &str) -> Option<ReadingClient> {
     let base_url = env::var("PTCHAN_GATEWAY_URL").ok()?;
     let base_url = base_url.trim().trim_end_matches('/').to_string();
     if base_url.is_empty() {
         return None;
     }
-    Some(ContextClient {
+    Some(ReadingClient {
         base_url,
-        consumer: env::var("PTCHAN_CONSUMER_NAME").unwrap_or_else(|_| "example".to_string()),
-        secret: webhook_secret.to_string(),
-        limit: env_usize("PTCHAN_CONTEXT_LIMIT", DEFAULT_CONTEXT_LIMIT),
+        integration: env::var("PTCHAN_INTEGRATION_NAME").unwrap_or_else(|_| "example".to_string()),
+        secret: integration_secret.to_string(),
+        limit: env_usize("PTCHAN_READING_LIMIT", DEFAULT_READING_LIMIT),
         client: Client::new(),
     })
 }

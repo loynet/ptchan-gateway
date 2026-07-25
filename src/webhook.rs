@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -77,6 +81,7 @@ async fn deliver_pending(
         }
         Err(err) => warn!(error = %err, "failed to count pending deliveries"),
     }
+    update_pending_by_webhook(endpoints, store);
     let deliveries = match store.pending_deliveries(50, Utc::now()) {
         Ok(deliveries) => deliveries,
         Err(err) => {
@@ -95,11 +100,15 @@ async fn deliver_pending(
             mark_failed(store, &delivery, "webhook is not configured");
             continue;
         };
+        let started_at = Instant::now();
         match deliver(client, endpoint, &delivery.event_id, &delivery.payload).await {
             Ok(()) => {
                 metrics::WEBHOOK_DELIVERIES
                     .with_label_values(&[delivery.webhook.as_str(), "success"])
                     .inc();
+                metrics::WEBHOOK_DELIVERY_SECONDS
+                    .with_label_values(&[delivery.webhook.as_str(), "success"])
+                    .observe(started_at.elapsed().as_secs_f64());
                 if let Err(err) =
                     store.mark_delivered(&delivery.event_id, &delivery.webhook, Utc::now())
                 {
@@ -112,9 +121,30 @@ async fn deliver_pending(
                 metrics::WEBHOOK_DELIVERIES
                     .with_label_values(&[delivery.webhook.as_str(), "failure"])
                     .inc();
+                metrics::WEBHOOK_DELIVERY_SECONDS
+                    .with_label_values(&[delivery.webhook.as_str(), "failure"])
+                    .observe(started_at.elapsed().as_secs_f64());
                 mark_failed(store, &delivery, &err.to_string());
             }
         }
+    }
+}
+
+fn update_pending_by_webhook(endpoints: &HashMap<String, WebhookConfig>, store: &store::Store) {
+    for webhook in endpoints.keys() {
+        metrics::WEBHOOK_PENDING_BY_WEBHOOK
+            .with_label_values(&[webhook])
+            .set(0);
+    }
+    match store.pending_counts_by_webhook() {
+        Ok(counts) => {
+            for (webhook, count) in counts {
+                metrics::WEBHOOK_PENDING_BY_WEBHOOK
+                    .with_label_values(&[webhook.as_str()])
+                    .set(count);
+            }
+        }
+        Err(err) => warn!(error = %err, "failed to count pending deliveries by webhook"),
     }
 }
 
@@ -165,7 +195,8 @@ fn signature(secret: &str, timestamp: &str, payload: &[u8]) -> Result<String> {
 
 fn mark_failed(store: &store::Store, delivery: &store::PendingDelivery, error: &str) {
     let attempts = delivery.attempts + 1;
-    let next = Utc::now() + chrono::Duration::from_std(store::delivery_backoff(attempts)).unwrap();
+    let backoff = i64::try_from(store::delivery_backoff(attempts).as_secs()).unwrap_or(300);
+    let next = Utc::now() + chrono::Duration::seconds(backoff);
     if let Err(err) =
         store.mark_failed(&delivery.event_id, &delivery.webhook, error, attempts, next)
     {

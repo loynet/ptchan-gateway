@@ -38,4 +38,18 @@ fn prune_once(store: &Store, retention: Duration) {
         }
         Err(err) => warn!(error = %err, "database retention cleanup failed"),
     }
+    match store.prune_produced_posts(cutoff) {
+        Ok(0) => debug!(%cutoff, "database retention cleanup found no produced posts"),
+        Ok(deleted) => {
+            info!(%cutoff, deleted, "database retention cleanup pruned produced posts");
+        }
+        Err(err) => warn!(error = %err, "database retention produced post cleanup failed"),
+    }
+    match store.prune_pending_produced_posts(cutoff) {
+        Ok(0) => debug!(%cutoff, "database retention cleanup found no pending produced posts"),
+        Ok(deleted) => {
+            info!(%cutoff, deleted, "database retention cleanup pruned pending produced posts");
+        }
+        Err(err) => warn!(error = %err, "database retention pending produced post cleanup failed"),
+    }
 }

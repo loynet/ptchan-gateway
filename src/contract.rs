@@ -35,6 +35,18 @@ impl fmt::Display for EventKind {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub(crate) struct PostOrigin {
+    pub(crate) kind: OriginKind,
+    pub(crate) name: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(crate) enum OriginKind {
+    #[serde(rename = "integration")]
+    Integration,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct Post {
     pub(crate) board: String,
     pub(crate) thread_id: i64,
@@ -58,6 +70,8 @@ pub(crate) struct Post {
     pub(crate) country: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) poster_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) origin: Option<PostOrigin>,
     pub(crate) attachment_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) references: Vec<PostRef>,

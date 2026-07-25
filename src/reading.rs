@@ -1,13 +1,10 @@
-use std::sync::Arc;
-
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde_json::{Map, Value};
 
 use crate::{
     config::{self, PtchanConfig},
-    consumer, event,
-    session::SessionCookie,
+    contract, event,
 };
 
 pub(crate) const DEFAULT_THREAD_LIMIT: usize = 50;
@@ -17,19 +14,17 @@ pub(crate) const MAX_THREAD_LIMIT: usize = 200;
 pub(crate) struct ThreadReader {
     base_url: String,
     client: Client,
-    cookie: Arc<SessionCookie>,
 }
 
 impl ThreadReader {
-    pub(crate) fn new(cfg: &PtchanConfig, cookie: Arc<SessionCookie>) -> Result<Self> {
+    pub(crate) fn new(cfg: &PtchanConfig) -> Result<Self> {
         let client = Client::builder()
             .user_agent(cfg.user_agent.clone())
             .build()
-            .context("build thread context client")?;
+            .context("build thread reading client")?;
         Ok(Self {
             base_url: cfg.base_url.clone(),
             client,
-            cookie,
         })
     }
 
@@ -38,7 +33,7 @@ impl ThreadReader {
         board: &str,
         thread_id: i64,
         limit: usize,
-    ) -> Result<Option<consumer::Thread>> {
+    ) -> Result<Option<contract::Thread>> {
         if !config::valid_board_name(board) {
             return Err(anyhow!("invalid board"));
         }
@@ -56,7 +51,6 @@ impl ThreadReader {
             .client
             .get(url)
             .header("accept", "application/json")
-            .header("cookie", self.cookie.get())
             .send()
             .await
             .context("fetch ptchan thread")?;
@@ -83,7 +77,7 @@ fn thread_from_value(
     thread_id: i64,
     value: Value,
     limit: usize,
-) -> Result<consumer::Thread> {
+) -> Result<contract::Thread> {
     let Value::Object(mut root) = value else {
         return Err(anyhow!("thread json must be an object"));
     };
@@ -97,7 +91,7 @@ fn thread_from_value(
 
     let mut posts = Vec::with_capacity(replies.len().saturating_add(1));
     ensure_board(&mut root, board);
-    posts.push(event::consumer_post_from_value(
+    posts.push(event::contract_post_from_value(
         base_url,
         Value::Object(root),
     )?);
@@ -107,7 +101,7 @@ fn thread_from_value(
         };
         ensure_board(&mut reply, board);
         ensure_thread(&mut reply, thread_id);
-        posts.push(event::consumer_post_from_value(
+        posts.push(event::contract_post_from_value(
             base_url,
             Value::Object(reply),
         )?);
@@ -119,7 +113,7 @@ fn thread_from_value(
         posts = posts.split_off(posts.len() - limit);
     }
 
-    Ok(consumer::Thread {
+    Ok(contract::Thread {
         board: board.to_string(),
         id: thread_id,
         posts,

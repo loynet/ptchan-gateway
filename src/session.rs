@@ -46,7 +46,7 @@ impl SessionCookie {
     pub(crate) fn get(&self) -> String {
         self.cookies
             .read()
-            .expect("cookie lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .map(|cookie| cookie.pair.as_str())
             .collect::<Vec<_>>()
@@ -56,7 +56,7 @@ impl SessionCookie {
     fn expires_at(&self) -> Option<DateTime<Utc>> {
         self.cookies
             .read()
-            .expect("cookie lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .filter_map(|cookie| cookie.expires_at)
             .min()
@@ -67,7 +67,10 @@ impl SessionCookie {
     }
 
     fn merge(&self, updates: Vec<ParsedCookieHeader>, now: DateTime<Utc>) -> bool {
-        let mut cookies = self.cookies.write().expect("cookie lock poisoned");
+        let mut cookies = self
+            .cookies
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut changed = false;
         for update in updates {
             for pair in update.pairs {

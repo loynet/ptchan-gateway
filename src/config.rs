@@ -4,19 +4,27 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use tracing_subscriber::{fmt, EnvFilter};
 
+const POSTING_NAME_MAX_CHARS: usize = 25;
+
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Config {
     pub(crate) ptchan: PtchanConfig,
     #[serde(default)]
     pub(crate) runtime: RuntimeConfig,
     pub(crate) storage: StorageConfig,
     #[serde(default)]
+    pub(crate) integration: Vec<IntegrationConfig>,
+    #[serde(skip)]
     pub(crate) webhook: Vec<WebhookConfig>,
+    #[serde(skip)]
+    pub(crate) posting: Vec<PostingConfig>,
     #[serde(skip)]
     pub(crate) fingerprint_secret: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PtchanConfig {
     pub(crate) base_url: String,
     #[serde(default = "gateway_user_agent")]
@@ -39,6 +47,7 @@ pub(crate) struct PtchanConfig {
 }
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeConfig {
     #[serde(default = "default_http_addr")]
     pub(crate) http_addr: String,
@@ -47,6 +56,7 @@ pub(crate) struct RuntimeConfig {
 }
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub(crate) level: String,
@@ -92,6 +102,7 @@ impl FromStr for LogFormat {
 }
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StorageConfig {
     pub(crate) sqlite_path: String,
     #[serde(
@@ -102,19 +113,99 @@ pub(crate) struct StorageConfig {
 }
 
 #[derive(Clone, Deserialize)]
-pub(crate) struct WebhookConfig {
+#[serde(deny_unknown_fields)]
+pub(crate) struct IntegrationConfig {
     pub(crate) name: String,
-    pub(crate) url: String,
     #[serde(default)]
     pub(crate) allowed_boards: Vec<String>,
     #[serde(default)]
-    pub(crate) include_poster_fingerprint: bool,
+    pub(crate) reading: Option<ReadingCapabilityConfig>,
+    #[serde(default)]
+    pub(crate) webhook: Option<WebhookCapabilityConfig>,
+    #[serde(default)]
+    pub(crate) posting: Option<PostingCapabilityConfig>,
     #[serde(skip)]
     pub(crate) secret: String,
+}
+
+impl IntegrationConfig {
+    pub(crate) fn reading_enabled(&self) -> bool {
+        self.reading.as_ref().is_some_and(|reading| reading.enabled)
+    }
+
+    pub(crate) fn board_allowed(&self, board: &str) -> bool {
+        board_allowed(&self.allowed_boards, board)
+    }
+}
+
+pub(crate) fn board_allowed(allowed_boards: &[String], board: &str) -> bool {
+    allowed_boards.is_empty()
+        || allowed_boards
+            .iter()
+            .any(|allowed_board| allowed_board == board)
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReadingCapabilityConfig {
+    #[serde(default = "default_enabled")]
+    pub(crate) enabled: bool,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WebhookCapabilityConfig {
+    pub(crate) url: String,
+    #[serde(default)]
+    pub(crate) include_poster_fingerprint: bool,
     #[serde(
         default = "default_webhook_timeout",
         deserialize_with = "duration_from_str"
     )]
+    pub(crate) timeout: Duration,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PostingCapabilityConfig {
+    #[serde(default)]
+    pub(crate) display_name: Option<String>,
+    #[serde(default)]
+    pub(crate) use_tripcode: bool,
+    #[serde(default = "default_secure_tripcode")]
+    pub(crate) secure_tripcode: bool,
+    #[serde(default)]
+    pub(crate) use_post_password: bool,
+    #[serde(skip)]
+    pub(crate) tripcode: Option<String>,
+    #[serde(skip)]
+    pub(crate) post_password: Option<String>,
+    #[serde(
+        default = "default_posting_timeout",
+        deserialize_with = "duration_from_str"
+    )]
+    pub(crate) timeout: Duration,
+}
+
+#[derive(Clone)]
+pub(crate) struct WebhookConfig {
+    pub(crate) name: String,
+    pub(crate) url: String,
+    pub(crate) allowed_boards: Vec<String>,
+    pub(crate) include_poster_fingerprint: bool,
+    pub(crate) secret: String,
+    pub(crate) timeout: Duration,
+}
+
+#[derive(Clone)]
+pub(crate) struct PostingConfig {
+    pub(crate) name: String,
+    pub(crate) allowed_boards: Vec<String>,
+    pub(crate) display_name: Option<String>,
+    pub(crate) secure_tripcode: bool,
+    pub(crate) secret: String,
+    pub(crate) tripcode: Option<String>,
+    pub(crate) post_password: Option<String>,
     pub(crate) timeout: Duration,
 }
 
@@ -129,19 +220,61 @@ impl Config {
             }
         }
         cfg.validate().context("validate config")?;
-        for wh in &mut cfg.webhook {
-            let env_name = webhook_secret_env(&wh.name);
-            wh.secret = env::var(&env_name).with_context(|| {
-                format!("webhook {} secret env {} is not set", wh.name, env_name)
+        for integration in &mut cfg.integration {
+            let env_name = integration_secret_env(&integration.name);
+            integration.secret = env::var(&env_name).with_context(|| {
+                format!(
+                    "integration {} secret env {} is not set",
+                    integration.name, env_name
+                )
             })?;
-            if wh.secret.trim().is_empty() {
+            if integration.secret.trim().is_empty() {
                 return Err(anyhow!(
-                    "webhook {} secret env {} is empty",
-                    wh.name,
+                    "integration {} secret env {} is empty",
+                    integration.name,
                     env_name
                 ));
             }
+            if let Some(posting) = &mut integration.posting {
+                if posting.use_tripcode {
+                    let env_name = integration_tripcode_env(&integration.name);
+                    let tripcode = env::var(&env_name).with_context(|| {
+                        format!(
+                            "integration {} tripcode env {} is not set",
+                            integration.name, env_name
+                        )
+                    })?;
+                    if tripcode.trim().is_empty() {
+                        return Err(anyhow!(
+                            "integration {} tripcode env {} is empty",
+                            integration.name,
+                            env_name
+                        ));
+                    }
+                    posting.tripcode = Some(tripcode);
+                }
+                if posting.use_post_password {
+                    let env_name = integration_post_password_env(&integration.name);
+                    let post_password = env::var(&env_name).with_context(|| {
+                        format!(
+                            "integration {} post password env {} is not set",
+                            integration.name, env_name
+                        )
+                    })?;
+                    if post_password.trim().is_empty() {
+                        return Err(anyhow!(
+                            "integration {} post password env {} is empty",
+                            integration.name,
+                            env_name
+                        ));
+                    }
+                    posting.post_password = Some(post_password);
+                }
+            }
         }
+        cfg.validate().context("validate loaded config")?;
+        cfg.webhook = cfg.webhooks();
+        cfg.posting = cfg.postings();
         if cfg.webhook.iter().any(|wh| wh.include_poster_fingerprint) {
             let secret = env::var("PTCHAN_FINGERPRINT_SECRET")
                 .context("fingerprint env PTCHAN_FINGERPRINT_SECRET is not set")?;
@@ -153,6 +286,42 @@ impl Config {
             cfg.fingerprint_secret = Some(secret);
         }
         Ok(cfg)
+    }
+
+    fn webhooks(&self) -> Vec<WebhookConfig> {
+        self.integration
+            .iter()
+            .filter_map(|integration| {
+                let webhook = integration.webhook.as_ref()?;
+                Some(WebhookConfig {
+                    name: integration.name.clone(),
+                    url: webhook.url.clone(),
+                    allowed_boards: integration.allowed_boards.clone(),
+                    include_poster_fingerprint: webhook.include_poster_fingerprint,
+                    secret: integration.secret.clone(),
+                    timeout: webhook.timeout,
+                })
+            })
+            .collect()
+    }
+
+    fn postings(&self) -> Vec<PostingConfig> {
+        self.integration
+            .iter()
+            .filter_map(|integration| {
+                let posting = integration.posting.as_ref()?;
+                Some(PostingConfig {
+                    name: integration.name.clone(),
+                    allowed_boards: integration.allowed_boards.clone(),
+                    display_name: posting.display_name.clone(),
+                    secure_tripcode: posting.secure_tripcode,
+                    secret: integration.secret.clone(),
+                    tripcode: posting.tripcode.clone(),
+                    post_password: posting.post_password.clone(),
+                    timeout: posting.timeout,
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
@@ -187,29 +356,69 @@ impl Config {
             return Err(anyhow!("storage.event_retention must be greater than zero"));
         }
         let mut names = HashSet::new();
-        for wh in &self.webhook {
-            if wh.name.trim().is_empty() {
-                return Err(anyhow!("webhook.name is required"));
+        let mut env_names = HashSet::new();
+        for integration in &self.integration {
+            if integration.name.trim().is_empty() {
+                return Err(anyhow!("integration.name is required"));
             }
-            if !names.insert(wh.name.as_str()) {
-                return Err(anyhow!("duplicate webhook name {}", wh.name));
-            }
-            reqwest::Url::parse(&wh.url)
-                .with_context(|| format!("webhook {} url must be absolute", wh.name))?;
-            if wh.timeout.is_zero() {
+            if !valid_integration_name(&integration.name) {
                 return Err(anyhow!(
-                    "webhook {} timeout must be greater than zero",
-                    wh.name
+                    "integration name {} is invalid; use 1-64 ASCII letters, digits, underscores, or hyphens",
+                    integration.name
                 ));
             }
-            for board in &wh.allowed_boards {
+            if !names.insert(integration.name.as_str()) {
+                return Err(anyhow!("duplicate integration name {}", integration.name));
+            }
+            let env_name = env_safe_name(&integration.name);
+            if !env_names.insert(env_name) {
+                return Err(anyhow!(
+                    "integration name {} conflicts with another integration environment name",
+                    integration.name
+                ));
+            }
+            if integration.reading.is_none()
+                && integration.webhook.is_none()
+                && integration.posting.is_none()
+            {
+                return Err(anyhow!(
+                    "integration {} must enable at least one capability",
+                    integration.name
+                ));
+            }
+            for board in &integration.allowed_boards {
                 if !valid_board_name(board) {
                     return Err(anyhow!(
-                        "webhook {} allowed board {} is invalid",
-                        wh.name,
+                        "integration {} allowed board {} is invalid",
+                        integration.name,
                         board
                     ));
                 }
+            }
+            if let Some(reading) = &integration.reading {
+                if !reading.enabled {
+                    return Err(anyhow!(
+                        "integration {} reading.enabled must be true or the reading section must be omitted",
+                        integration.name
+                    ));
+                }
+            }
+            if let Some(webhook) = &integration.webhook {
+                reqwest::Url::parse(&webhook.url).with_context(|| {
+                    format!(
+                        "integration {} webhook url must be absolute",
+                        integration.name
+                    )
+                })?;
+                if webhook.timeout.is_zero() {
+                    return Err(anyhow!(
+                        "integration {} webhook timeout must be greater than zero",
+                        integration.name
+                    ));
+                }
+            }
+            if let Some(posting) = &integration.posting {
+                validate_posting(&integration.name, posting)?;
             }
         }
         Ok(())
@@ -227,9 +436,20 @@ pub(crate) fn ptchan_session_cookie() -> Result<String> {
     Ok(cookie)
 }
 
-fn webhook_secret_env(name: &str) -> String {
-    let normalized = name
-        .chars()
+fn integration_secret_env(name: &str) -> String {
+    format!("PTCHAN_INTEGRATION_{}_SECRET", env_safe_name(name))
+}
+
+fn integration_tripcode_env(name: &str) -> String {
+    format!("PTCHAN_INTEGRATION_{}_TRIPCODE", env_safe_name(name))
+}
+
+fn integration_post_password_env(name: &str) -> String {
+    format!("PTCHAN_INTEGRATION_{}_POST_PASSWORD", env_safe_name(name))
+}
+
+fn env_safe_name(name: &str) -> String {
+    name.chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() {
                 ch.to_ascii_uppercase()
@@ -237,8 +457,44 @@ fn webhook_secret_env(name: &str) -> String {
                 '_'
             }
         })
-        .collect::<String>();
-    format!("PTCHAN_WEBHOOK_{normalized}_SECRET")
+        .collect()
+}
+
+fn posting_form_name(integration_name: &str, posting: &PostingCapabilityConfig) -> Option<String> {
+    let name = posting
+        .display_name
+        .as_deref()
+        .unwrap_or(integration_name)
+        .trim();
+    match posting.tripcode.as_deref() {
+        Some(tripcode) if posting.secure_tripcode => Some(format!("{name}##{tripcode}")),
+        Some(tripcode) => Some(format!("{name}#{tripcode}")),
+        None if name.is_empty() => None,
+        None => Some(name.to_string()),
+    }
+}
+
+fn validate_posting(integration_name: &str, posting: &PostingCapabilityConfig) -> Result<()> {
+    if posting.timeout.is_zero() {
+        return Err(anyhow!(
+            "integration {integration_name} posting timeout must be greater than zero"
+        ));
+    }
+    if matches!(posting.display_name.as_deref(), Some(name) if name.trim().is_empty()) {
+        return Err(anyhow!(
+            "integration {integration_name} posting display_name must not be empty"
+        ));
+    }
+    let Some(name) = posting_form_name(integration_name, posting) else {
+        return Ok(());
+    };
+    let name_len = name.chars().count();
+    if name_len > POSTING_NAME_MAX_CHARS {
+        return Err(anyhow!(
+            "integration {integration_name} posting name is {name_len} characters; ptchan allows {POSTING_NAME_MAX_CHARS} or less"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn valid_board_name(board: &str) -> bool {
@@ -247,6 +503,14 @@ pub(crate) fn valid_board_name(board: &str) -> bool {
         && board
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn valid_integration_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 pub(crate) fn init_logging(cfg: &LoggingConfig) -> Result<()> {
@@ -310,6 +574,15 @@ fn default_log_level() -> String {
 fn default_webhook_timeout() -> Duration {
     Duration::from_secs(10)
 }
+fn default_posting_timeout() -> Duration {
+    Duration::from_secs(15)
+}
+const fn default_enabled() -> bool {
+    true
+}
+const fn default_secure_tripcode() -> bool {
+    true
+}
 fn default_event_retention() -> Duration {
     Duration::from_hours(14 * 24)
 }
@@ -344,13 +617,65 @@ mod tests {
     #[test]
     fn validates_webhook_timeout() {
         let mut cfg = valid_config();
-        cfg.webhook[0].timeout = Duration::ZERO;
+        cfg.integration[0].webhook.as_mut().unwrap().timeout = Duration::ZERO;
 
         let err = cfg.validate().unwrap_err();
 
         assert!(err
             .to_string()
-            .contains("webhook example timeout must be greater than zero"));
+            .contains("integration example webhook timeout must be greater than zero"));
+    }
+
+    #[test]
+    fn validates_posting_name_length_after_tripcode() {
+        let mut cfg = valid_config();
+        cfg.integration[0].posting = Some(PostingCapabilityConfig {
+            display_name: Some("ptchan-gateway".to_string()),
+            use_tripcode: true,
+            secure_tripcode: true,
+            use_post_password: false,
+            tripcode: Some("this-is-an-example-ok".to_string()),
+            post_password: None,
+            timeout: Duration::from_secs(15),
+        });
+
+        let err = cfg.validate().unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("integration example posting name is"));
+    }
+
+    #[test]
+    fn validates_integration_names_for_env_and_metrics() {
+        let mut cfg = valid_config();
+        cfg.integration[0].name = "bad name".to_string();
+
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("integration name bad name is invalid"));
+    }
+
+    #[test]
+    fn rejects_integration_env_name_collisions() {
+        let mut cfg = valid_config();
+        cfg.integration.push(IntegrationConfig {
+            name: "example-test".to_string(),
+            allowed_boards: Vec::new(),
+            reading: Some(ReadingCapabilityConfig { enabled: true }),
+            webhook: None,
+            posting: None,
+            secret: String::new(),
+        });
+        cfg.integration[0].name = "example_test".to_string();
+
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with another integration environment name"));
     }
 
     #[test]
@@ -403,14 +728,20 @@ sqlite_path = "data/test.db"
                 sqlite_path: "data/test.db".to_string(),
                 event_retention: Duration::from_hours(14 * 24),
             },
-            webhook: vec![WebhookConfig {
+            integration: vec![IntegrationConfig {
                 name: "example".to_string(),
-                url: "http://127.0.0.1:8081/events".to_string(),
                 allowed_boards: Vec::new(),
-                include_poster_fingerprint: false,
+                reading: Some(ReadingCapabilityConfig { enabled: true }),
+                webhook: Some(WebhookCapabilityConfig {
+                    url: "http://127.0.0.1:8081/events".to_string(),
+                    include_poster_fingerprint: false,
+                    timeout: Duration::from_secs(10),
+                }),
+                posting: None,
                 secret: String::new(),
-                timeout: Duration::from_secs(10),
             }],
+            webhook: Vec::new(),
+            posting: Vec::new(),
             fingerprint_secret: None,
         }
     }

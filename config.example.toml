@@ -5,11 +5,23 @@ session_refresh_fallback_interval = "12h"
 socket_reconnect_min = "3s"
 socket_reconnect_max = "60s"
 
-[[webhook]]
+[[integration]]
 name = "example"
-url = "http://127.0.0.1:8081/internal/ptchan/events"
 allowed_boards = []
+
+[integration.reading]
+enabled = true
+
+[integration.webhook]
+url = "http://127.0.0.1:8081/internal/ptchan/events"
 include_poster_fingerprint = false
+
+[integration.posting]
+display_name = "ptchan-gateway"
+use_tripcode = true
+secure_tripcode = true
+use_post_password = true
+timeout = "15s"
 
 [runtime]
 http_addr = "0.0.0.0:8080"

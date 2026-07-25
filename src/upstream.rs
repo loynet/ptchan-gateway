@@ -64,7 +64,7 @@ impl TryFrom<Value> for DecodedPost {
     }
 }
 
-pub(crate) fn assert_consumer_safe(payload: &[u8]) -> Result<()> {
+pub(crate) fn assert_contract_safe(payload: &[u8]) -> Result<()> {
     let value = serde_json::from_slice(payload).context("decode encoded event payload")?;
     reject_sensitive_fields(&value)
 }
@@ -162,10 +162,10 @@ mod tests {
     }
 
     #[test]
-    fn checks_encoded_consumer_payloads() {
+    fn checks_encoded_contract_payloads() {
         let payload = br#"{"event_id":"x","session":"secret"}"#;
 
-        let err = assert_consumer_safe(payload).unwrap_err();
+        let err = assert_contract_safe(payload).unwrap_err();
 
         assert!(err.to_string().contains("sensitive field session"));
     }

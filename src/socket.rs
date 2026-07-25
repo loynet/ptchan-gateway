@@ -27,6 +27,7 @@ use crate::{
 };
 
 const ROOM: &str = "globalmanage-recent-hashed";
+const PENDING_ORIGIN_WINDOW_SECONDS: i64 = 60;
 
 #[derive(Clone)]
 pub(crate) struct Supervisor {
@@ -54,7 +55,7 @@ pub(crate) async fn supervise(supervisor: Supervisor, mut shutdown: watch::Recei
             }
             continue;
         }
-        metrics::SOCKET_RECONNECTS.inc();
+        metrics::SOCKET_CONNECTION_ATTEMPTS.inc();
         let stop_socket = Arc::new(AtomicBool::new(false));
         let once_supervisor = supervisor.clone();
         let once_stop = stop_socket.clone();
@@ -97,6 +98,7 @@ pub(crate) async fn supervise(supervisor: Supervisor, mut shutdown: watch::Recei
     }
 }
 
+// This runs in a blocking task; owning Supervisor keeps the socket callbacks 'static.
 #[allow(clippy::needless_pass_by_value)]
 fn run_socket_once(supervisor: Supervisor, stop: Arc<AtomicBool>) -> Result<bool> {
     let closed = Arc::new(AtomicBool::new(false));
@@ -194,7 +196,24 @@ fn handle_new_post(
     };
     debug!(shape = %json_shape(&value), "socket newPost received");
     match event::gateway_event(base_url, value, Utc::now()) {
-        Ok(built) => {
+        Ok(mut built) => {
+            match store.produced_post_origin_or_claim_pending(
+                &built.event.post.board,
+                built.event.post.thread_id,
+                built.event.post.id,
+                built.event.post.message.as_deref(),
+                Utc::now() - chrono::Duration::seconds(PENDING_ORIGIN_WINDOW_SECONDS),
+                Utc::now(),
+            ) {
+                Ok(origin) => built.event.post.origin = origin,
+                Err(err) => {
+                    metrics::SOCKET_EVENTS
+                        .with_label_values(&["store_error"])
+                        .inc();
+                    warn!(error = %err, "failed to load produced post origin");
+                    return;
+                }
+            }
             let deliveries = match event_deliveries(&built, webhooks, fingerprint_secret) {
                 Ok(deliveries) => deliveries,
                 Err(err) => {
@@ -306,6 +325,7 @@ fn message_is_joined(payload: &Payload) -> bool {
     }
 }
 
+// rust_socketio still exposes a deprecated payload variant, so keep this broad.
 #[allow(clippy::match_wildcard_for_single_variants)]
 fn safe_payload_debug(payload: &Payload) -> String {
     match payload {
@@ -353,7 +373,7 @@ fn json_shape(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::{EventKind, Post, WebhookEvent};
+    use crate::contract::{EventKind, Post, WebhookEvent};
 
     #[test]
     fn event_deliveries_respects_allowed_boards() {
@@ -406,6 +426,7 @@ mod tests {
                     donor: None,
                     country: None,
                     poster_fingerprint: None,
+                    origin: None,
                     attachment_count: 0,
                     references: Vec::new(),
                     referenced_by: Vec::new(),

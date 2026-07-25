@@ -4,7 +4,7 @@ use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::Sha256;
 
-use crate::{consumer, upstream};
+use crate::{contract, upstream};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -18,13 +18,13 @@ pub(crate) fn gateway_event(
     let poster_identity = decoded.poster_identity;
     let post = decoded.post;
     let kind = if post.thread.is_some() {
-        consumer::EventKind::PostCreated
+        contract::EventKind::PostCreated
     } else {
-        consumer::EventKind::ThreadCreated
+        contract::EventKind::ThreadCreated
     };
     let event_id = format!("ptchan:{}:{}:{}", kind.as_str(), post.board, post.id);
-    let post = consumer_post(base_url, post);
-    let event = consumer::WebhookEvent {
+    let post = contract_post(base_url, post);
+    let event = contract::WebhookEvent {
         event_id,
         kind,
         source: "ptchan".to_string(),
@@ -39,13 +39,13 @@ pub(crate) fn gateway_event(
     })
 }
 
-pub(crate) fn consumer_post_from_value(base_url: &str, value: Value) -> Result<consumer::Post> {
+pub(crate) fn contract_post_from_value(base_url: &str, value: Value) -> Result<contract::Post> {
     let post = upstream::DecodedPost::try_from(value)
         .map_err(|err| anyhow!("decode upstream post: {err}"))?;
-    Ok(consumer_post(base_url, post.post))
+    Ok(contract_post(base_url, post.post))
 }
 
-fn consumer_post(base_url: &str, post: upstream::Post) -> consumer::Post {
+fn contract_post(base_url: &str, post: upstream::Post) -> contract::Post {
     let thread_id = post.thread.unwrap_or(post.id);
     let board = post.board;
     let url = format!(
@@ -55,20 +55,21 @@ fn consumer_post(base_url: &str, post: upstream::Post) -> consumer::Post {
         thread_id,
         post.id
     );
-    consumer::Post {
+    contract::Post {
         board: board.clone(),
         thread_id,
         id: post.id,
         url,
         date: post.date,
         subject: clean(post.subject),
-        message: consumer_message(post.nomarkup, post.message),
+        message: contract_message(post.nomarkup, post.message),
         name: clean(post.name),
         tripcode: clean(post.tripcode),
         capcode: clean(post.capcode),
         donor: post.donor,
         country: country_code(post.country),
         poster_fingerprint: None,
+        origin: None,
         attachment_count: post.files.len(),
         references: post_refs(post.quotes, &board, thread_id),
         referenced_by: post_refs(post.backlinks, &board, thread_id),
@@ -77,14 +78,14 @@ fn consumer_post(base_url: &str, post: upstream::Post) -> consumer::Post {
 
 #[derive(Debug)]
 pub(crate) struct BuiltEvent {
-    pub(crate) event: consumer::WebhookEvent,
+    pub(crate) event: contract::WebhookEvent,
     pub(crate) payload: Vec<u8>,
     pub(crate) poster_identity: Option<String>,
 }
 
-pub(crate) fn encode_event(event: &consumer::WebhookEvent) -> Result<Vec<u8>> {
+pub(crate) fn encode_event(event: &contract::WebhookEvent) -> Result<Vec<u8>> {
     let payload = serde_json::to_vec(event).context("encode gateway event")?;
-    upstream::assert_consumer_safe(&payload)?;
+    upstream::assert_contract_safe(&payload)?;
     Ok(payload)
 }
 
@@ -107,7 +108,7 @@ pub(crate) fn poster_fingerprint(
     )))
 }
 
-fn post_refs(values: Vec<Value>, board: &str, thread_id: i64) -> Vec<consumer::PostRef> {
+fn post_refs(values: Vec<Value>, board: &str, thread_id: i64) -> Vec<contract::PostRef> {
     values
         .into_iter()
         .filter_map(|value| post_ref(value, board, thread_id))
@@ -118,14 +119,14 @@ fn post_ref(
     value: Value,
     fallback_board: &str,
     fallback_thread_id: i64,
-) -> Option<consumer::PostRef> {
+) -> Option<contract::PostRef> {
     match value {
-        Value::Number(number) => number.as_i64().map(|post_id| consumer::PostRef {
+        Value::Number(number) => number.as_i64().map(|post_id| contract::PostRef {
             board: fallback_board.to_string(),
             thread_id: fallback_thread_id,
             id: post_id,
         }),
-        Value::String(text) => text.parse::<i64>().ok().map(|post_id| consumer::PostRef {
+        Value::String(text) => text.parse::<i64>().ok().map(|post_id| contract::PostRef {
             board: fallback_board.to_string(),
             thread_id: fallback_thread_id,
             id: post_id,
@@ -145,7 +146,7 @@ fn post_ref(
                 .or_else(|| map.get("thread_id"))
                 .and_then(Value::as_i64)
                 .unwrap_or(fallback_thread_id);
-            Some(consumer::PostRef {
+            Some(contract::PostRef {
                 board,
                 thread_id,
                 id: post_id,
@@ -166,9 +167,9 @@ fn clean(value: Option<String>) -> Option<String> {
     })
 }
 
-fn consumer_message(nomarkup: Option<String>, message: Option<String>) -> Option<String> {
+fn contract_message(nomarkup: Option<String>, message: Option<String>) -> Option<String> {
     // Upstream `message` is rendered HTML. `nomarkup` is the readable post text
-    // consumers need; fall back only when upstream does not provide it.
+    // integrations need; fall back only when upstream does not provide it.
     clean(nomarkup).or_else(|| clean(message))
 }
 
@@ -179,7 +180,7 @@ fn country_code(country: Option<upstream::Country>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::EventKind;
+    use crate::contract::EventKind;
     use serde_json::json;
 
     #[test]
@@ -238,7 +239,7 @@ mod tests {
         let built = gateway_event("https://ptchan.test", payload, Utc::now()).unwrap();
         let fingerprint = poster_fingerprint(
             "gateway-secret",
-            "consumer-a",
+            "integration-a",
             built.poster_identity.as_deref(),
         )
         .unwrap()
@@ -249,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_post_references_to_consumer_contract() {
+    fn maps_post_references_to_integration_contract() {
         let payload = json!({
             "date": "2026-07-19T12:00:00.000Z",
             "board": "i",
@@ -278,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn prefers_plain_nomarkup_message_for_consumers() {
+    fn prefers_plain_nomarkup_message_for_integrations() {
         let payload = json!({
             "date": "2026-07-19T12:00:00.000Z",
             "board": "i",
@@ -288,7 +289,7 @@ mod tests {
             "nomarkup": ">>303918"
         });
 
-        let post = consumer_post_from_value("https://ptchan.test", payload).unwrap();
+        let post = contract_post_from_value("https://ptchan.test", payload).unwrap();
 
         assert_eq!(post.message.as_deref(), Some(">>303918"));
     }
@@ -311,8 +312,8 @@ mod tests {
             "nomarkup": " "
         });
 
-        let missing_post = consumer_post_from_value("https://ptchan.test", missing).unwrap();
-        let empty_post = consumer_post_from_value("https://ptchan.test", empty).unwrap();
+        let missing_post = contract_post_from_value("https://ptchan.test", missing).unwrap();
+        let empty_post = contract_post_from_value("https://ptchan.test", empty).unwrap();
 
         assert_eq!(missing_post.message.as_deref(), Some("rendered body"));
         assert_eq!(empty_post.message.as_deref(), Some("rendered body"));
@@ -344,7 +345,7 @@ mod tests {
             "postId": 101,
             "message": "reply"
         });
-        let post = consumer_post_from_value("https://ptchan.test", payload).unwrap();
+        let post = contract_post_from_value("https://ptchan.test", payload).unwrap();
 
         assert_eq!(post.country, None);
     }
@@ -359,7 +360,7 @@ mod tests {
             "message": "reply",
             "country": null
         });
-        let post = consumer_post_from_value("https://ptchan.test", payload).unwrap();
+        let post = contract_post_from_value("https://ptchan.test", payload).unwrap();
 
         assert_eq!(post.country, None);
     }

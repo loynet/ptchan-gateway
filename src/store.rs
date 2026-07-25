@@ -7,6 +7,7 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 
 use crate::metrics;
 
@@ -74,6 +75,27 @@ impl Store {
 
                 CREATE INDEX IF NOT EXISTS deliveries_pending_idx
                     ON deliveries(status, next_attempt_at);
+
+                CREATE TABLE IF NOT EXISTS produced_posts (
+                    board TEXT NOT NULL,
+                    thread_id INTEGER NOT NULL,
+                    post_id INTEGER NOT NULL,
+                    producer TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (board, thread_id, post_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS pending_produced_posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    board TEXT NOT NULL,
+                    thread_id INTEGER NOT NULL,
+                    producer TEXT NOT NULL,
+                    message_digest TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS pending_produced_posts_match_idx
+                    ON pending_produced_posts(board, thread_id, message_digest, created_at);
                 ",
             )
             .context("create schema")?;
@@ -83,7 +105,7 @@ impl Store {
 
     pub(crate) fn create_event(
         &self,
-        event: &crate::consumer::WebhookEvent,
+        event: &crate::contract::WebhookEvent,
         payload: &[u8],
         deliveries: &[EventDelivery],
     ) -> Result<bool> {
@@ -211,6 +233,24 @@ impl Store {
         })
     }
 
+    pub(crate) fn pending_counts_by_webhook(&self) -> Result<Vec<(String, i64)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT webhook, COUNT(*)
+                     FROM deliveries
+                     WHERE status = 'pending'
+                     GROUP BY webhook",
+                )
+                .context("prepare pending delivery counts by webhook")?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .context("query pending delivery counts by webhook")?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .context("collect pending delivery counts by webhook")
+        })
+    }
+
     pub(crate) fn next_delivery_delay(&self, now: DateTime<Utc>) -> Result<Option<Duration>> {
         self.with_conn(|conn| {
             let next: Option<String> = conn
@@ -251,6 +291,153 @@ impl Store {
         })
     }
 
+    pub(crate) fn prune_produced_posts(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM produced_posts WHERE created_at < ?1",
+                params![cutoff.to_rfc3339()],
+            )
+            .context("prune produced posts")
+        })
+    }
+
+    pub(crate) fn prune_pending_produced_posts(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM pending_produced_posts WHERE created_at < ?1",
+                params![cutoff.to_rfc3339()],
+            )
+            .context("prune pending produced posts")
+        })
+    }
+
+    pub(crate) fn record_pending_produced_post(
+        &self,
+        board: &str,
+        thread_id: i64,
+        integration: &str,
+        message: &str,
+        now: DateTime<Utc>,
+    ) -> Result<i64> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO pending_produced_posts (board, thread_id, producer, message_digest, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    board,
+                    thread_id,
+                    integration,
+                    message_digest(message),
+                    now.to_rfc3339()
+                ],
+            )
+            .context("record pending produced post")?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    pub(crate) fn delete_pending_produced_post(&self, pending_id: i64) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM pending_produced_posts WHERE id = ?1",
+                params![pending_id],
+            )
+            .context("delete pending produced post")?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn record_produced_post(
+        &self,
+        board: &str,
+        thread_id: i64,
+        post_id: i64,
+        integration: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO produced_posts (board, thread_id, post_id, producer, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![board, thread_id, post_id, integration, now.to_rfc3339()],
+            )
+            .context("record produced post")?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn produced_post_origin_or_claim_pending(
+        &self,
+        board: &str,
+        thread_id: i64,
+        post_id: i64,
+        message: Option<&str>,
+        pending_cutoff: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<crate::contract::PostOrigin>> {
+        self.with_conn(|conn| {
+            if let Some(origin) = produced_post_origin(conn, board, thread_id, post_id)? {
+                return Ok(Some(origin));
+            }
+            let Some(message) = message else {
+                return Ok(None);
+            };
+            // If ptchan accepts a reply but does not return a post id, the socket
+            // event is our second chance to mark origin. This is intentionally
+            // best-effort: missing/changed message text, expiry, or identical
+            // pending replies can prevent a confident match.
+            let tx = conn.transaction().context("begin pending produced post claim")?;
+            let pending: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT id, producer FROM pending_produced_posts
+                     WHERE board = ?1
+                     AND thread_id = ?2
+                     AND message_digest = ?3
+                     AND created_at >= ?4
+                     ORDER BY created_at
+                     LIMIT 1",
+                    params![
+                        board,
+                        thread_id,
+                        message_digest(message),
+                        pending_cutoff.to_rfc3339()
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .context("query pending produced post")?;
+            let Some((pending_id, integration)) = pending else {
+                tx.commit().context("commit empty pending produced post claim")?;
+                return Ok(None);
+            };
+            tx.execute(
+                "DELETE FROM pending_produced_posts WHERE id = ?1",
+                params![pending_id],
+            )
+            .context("delete claimed pending produced post")?;
+            tx.execute(
+                "INSERT OR REPLACE INTO produced_posts (board, thread_id, post_id, producer, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![board, thread_id, post_id, &integration, now.to_rfc3339()],
+            )
+            .context("record claimed produced post")?;
+            tx.commit().context("commit pending produced post claim")?;
+            Ok(Some(crate::contract::PostOrigin {
+                kind: crate::contract::OriginKind::Integration,
+                name: integration,
+            }))
+        })
+    }
+
+    pub(crate) fn produced_post_origin(
+        &self,
+        board: &str,
+        thread_id: i64,
+        post_id: i64,
+    ) -> Result<Option<crate::contract::PostOrigin>> {
+        self.with_conn(|conn| produced_post_origin(conn, board, thread_id, post_id))
+    }
+
     pub(crate) fn is_ready(&self) -> bool {
         self.with_conn(|conn| {
             let value: Option<i64> = conn
@@ -262,7 +449,10 @@ impl Store {
     }
 
     fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
-        let mut conn = self.inner.lock().expect("sqlite mutex poisoned");
+        let mut conn = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match f(&mut conn) {
             Ok(value) => Ok(value),
             Err(err) => {
@@ -282,10 +472,35 @@ fn truncate(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
 
+fn produced_post_origin(
+    conn: &Connection,
+    board: &str,
+    thread_id: i64,
+    post_id: i64,
+) -> Result<Option<crate::contract::PostOrigin>> {
+    let integration = conn
+        .query_row(
+            "SELECT producer FROM produced_posts
+             WHERE board = ?1 AND thread_id = ?2 AND post_id = ?3",
+            params![board, thread_id, post_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("query produced post origin")?;
+    Ok(integration.map(|name| crate::contract::PostOrigin {
+        kind: crate::contract::OriginKind::Integration,
+        name,
+    }))
+}
+
+fn message_digest(message: &str) -> String {
+    hex::encode(Sha256::digest(message.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::{EventKind, Post, WebhookEvent};
+    use crate::contract::{EventKind, Post, WebhookEvent};
     use chrono::{Duration as ChronoDuration, Utc};
 
     #[test]
@@ -352,12 +567,39 @@ mod tests {
         let store = Store::open(&dir.path().join("test.db")).unwrap();
         store.migrate().unwrap();
         let event = event("ptchan:post.created:i:301", Utc::now());
-        let deliveries = deliveries("martie", br#"{"consumer":"martie"}"#.to_vec());
+        let deliveries = deliveries("martie", br#"{"integration":"martie"}"#.to_vec());
 
         assert!(store.create_event(&event, br"{}", &deliveries).unwrap());
         let pending = store.pending_deliveries(10, Utc::now()).unwrap();
 
-        assert_eq!(pending[0].payload, br#"{"consumer":"martie"}"#);
+        assert_eq!(pending[0].payload, br#"{"integration":"martie"}"#);
+    }
+
+    #[test]
+    fn counts_pending_deliveries_by_webhook() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("test.db")).unwrap();
+        store.migrate().unwrap();
+        let now = Utc::now();
+        let event = event("ptchan:post.created:i:302", now);
+        let deliveries = vec![
+            EventDelivery {
+                webhook: "one".to_string(),
+                payload: b"{}".to_vec(),
+            },
+            EventDelivery {
+                webhook: "two".to_string(),
+                payload: b"{}".to_vec(),
+            },
+        ];
+
+        assert!(store.create_event(&event, b"{}", &deliveries).unwrap());
+        store.mark_delivered(&event.event_id, "two", now).unwrap();
+
+        assert_eq!(
+            store.pending_counts_by_webhook().unwrap(),
+            vec![("one".to_string(), 1)]
+        );
     }
 
     fn event(event_id: &str, observed_at: DateTime<Utc>) -> WebhookEvent {
@@ -380,11 +622,161 @@ mod tests {
                 donor: None,
                 country: None,
                 poster_fingerprint: None,
+                origin: None,
                 attachment_count: 0,
                 references: Vec::new(),
                 referenced_by: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn records_produced_post_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("test.db")).unwrap();
+        store.migrate().unwrap();
+
+        store
+            .record_produced_post("i", 100, 101, "agent", Utc::now())
+            .unwrap();
+        let origin = store.produced_post_origin("i", 100, 101).unwrap().unwrap();
+
+        assert_eq!(origin.name, "agent");
+        assert!(store.produced_post_origin("i", 100, 102).unwrap().is_none());
+    }
+
+    #[test]
+    fn claims_pending_produced_post_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("test.db")).unwrap();
+        store.migrate().unwrap();
+        let now = Utc::now();
+
+        store
+            .record_pending_produced_post("i", 100, "agent", "hello", now)
+            .unwrap();
+
+        let origin = store
+            .produced_post_origin_or_claim_pending(
+                "i",
+                100,
+                101,
+                Some("hello"),
+                now - ChronoDuration::seconds(60),
+                now,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(origin.name, "agent");
+        assert!(store.produced_post_origin("i", 100, 101).unwrap().is_some());
+        assert!(store
+            .produced_post_origin_or_claim_pending(
+                "i",
+                100,
+                102,
+                Some("hello"),
+                now - ChronoDuration::seconds(60),
+                now,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn pending_produced_post_claim_respects_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("test.db")).unwrap();
+        store.migrate().unwrap();
+        let now = Utc::now();
+
+        store
+            .record_pending_produced_post(
+                "i",
+                100,
+                "agent",
+                "hello",
+                now - ChronoDuration::minutes(5),
+            )
+            .unwrap();
+
+        assert!(store
+            .produced_post_origin_or_claim_pending(
+                "i",
+                100,
+                101,
+                Some("hello"),
+                now - ChronoDuration::seconds(60),
+                now,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn prunes_old_produced_posts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("test.db")).unwrap();
+        store.migrate().unwrap();
+        let now = Utc::now();
+
+        store
+            .record_produced_post("i", 100, 101, "agent", now - ChronoDuration::days(30))
+            .unwrap();
+        store
+            .record_produced_post("i", 100, 102, "agent", now)
+            .unwrap();
+
+        let deleted = store
+            .prune_produced_posts(now - ChronoDuration::days(14))
+            .unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(store.produced_post_origin("i", 100, 101).unwrap().is_none());
+        assert!(store.produced_post_origin("i", 100, 102).unwrap().is_some());
+    }
+
+    #[test]
+    fn prunes_old_pending_produced_posts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("test.db")).unwrap();
+        store.migrate().unwrap();
+        let now = Utc::now();
+
+        store
+            .record_pending_produced_post("i", 100, "agent", "old", now - ChronoDuration::days(30))
+            .unwrap();
+        store
+            .record_pending_produced_post("i", 100, "agent", "recent", now)
+            .unwrap();
+
+        let deleted = store
+            .prune_pending_produced_posts(now - ChronoDuration::days(14))
+            .unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(store
+            .produced_post_origin_or_claim_pending(
+                "i",
+                100,
+                101,
+                Some("old"),
+                now - ChronoDuration::days(40),
+                now,
+            )
+            .unwrap()
+            .is_none());
+        assert!(store
+            .produced_post_origin_or_claim_pending(
+                "i",
+                100,
+                102,
+                Some("recent"),
+                now - ChronoDuration::days(40),
+                now,
+            )
+            .unwrap()
+            .is_some());
     }
 
     fn event_count(store: &Store) -> Result<i64> {

@@ -1,8 +1,9 @@
 mod config;
-mod consumer;
-mod context;
+mod contract;
 mod event;
 mod metrics;
+mod posting;
+mod reading;
 mod retention;
 mod runtime;
 mod session;
@@ -15,7 +16,7 @@ use std::{path::PathBuf, str::FromStr, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::{watch, Notify};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 enum Command {
     Run,
@@ -72,47 +73,58 @@ fn command_from_args() -> Result<Command> {
 }
 
 async fn run(cfg: config::Config) -> Result<()> {
-    let cookie = config::ptchan_session_cookie().context("load ptchan session cookie")?;
-    let cookie_jar = Arc::new(session::SessionCookie::new(&cookie));
+    let upstream_required = !cfg.webhook.is_empty();
     let sqlite_path = PathBuf::from(&cfg.storage.sqlite_path);
     let store = Arc::new(store::Store::open(&sqlite_path).context("open sqlite")?);
     store.migrate().context("migrate sqlite")?;
-    let thread_reader = context::ThreadReader::new(&cfg.ptchan, cookie_jar.clone())
-        .context("create context reader")?;
+    let thread_reader = reading::ThreadReader::new(&cfg.ptchan).context("create reading client")?;
+    let post_writer = posting::PostWriter::new(&cfg.ptchan).context("create posting writer")?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let status = Arc::new(runtime::Status::default());
+    let status = Arc::new(runtime::Status::new(upstream_required));
     let delivery_wakeup = Arc::new(Notify::new());
 
     let http_handle = runtime::spawn_http(
-        cfg.runtime.http_addr.clone(),
-        status.clone(),
-        store.clone(),
-        thread_reader,
-        cfg.webhook.clone(),
+        runtime::HttpServer {
+            addr: cfg.runtime.http_addr.clone(),
+            status: status.clone(),
+            store: store.clone(),
+            thread_reader,
+            post_writer,
+            integrations: cfg.integration.clone(),
+            postings: cfg.posting.clone(),
+        },
         shutdown_rx.clone(),
     )
     .await
     .context("start runtime http server")?;
 
-    let refresh_handle = tokio::spawn(session::refresh_loop(
-        cfg.ptchan.clone(),
-        cookie_jar.clone(),
-        status.clone(),
-        shutdown_rx.clone(),
-    ));
-    let socket_handle = tokio::spawn(socket::supervise(
-        socket::Supervisor {
-            cfg: cfg.ptchan.clone(),
-            cookie: cookie_jar.clone(),
-            store: store.clone(),
-            webhooks: cfg.webhook.clone(),
-            fingerprint_secret: cfg.fingerprint_secret.clone(),
-            delivery_wakeup: delivery_wakeup.clone(),
-            status: status.clone(),
-        },
-        shutdown_rx.clone(),
-    ));
+    let (refresh_handle, socket_handle) = if upstream_required {
+        let cookie = config::ptchan_session_cookie().context("load ptchan session cookie")?;
+        let cookie_jar = Arc::new(session::SessionCookie::new(&cookie));
+        let refresh_handle = tokio::spawn(session::refresh_loop(
+            cfg.ptchan.clone(),
+            cookie_jar.clone(),
+            status.clone(),
+            shutdown_rx.clone(),
+        ));
+        let socket_handle = tokio::spawn(socket::supervise(
+            socket::Supervisor {
+                cfg: cfg.ptchan.clone(),
+                cookie: cookie_jar,
+                store: store.clone(),
+                webhooks: cfg.webhook.clone(),
+                fingerprint_secret: cfg.fingerprint_secret.clone(),
+                delivery_wakeup: delivery_wakeup.clone(),
+                status: status.clone(),
+            },
+            shutdown_rx.clone(),
+        ));
+        (Some(refresh_handle), Some(socket_handle))
+    } else {
+        info!("no webhook integrations configured; skipping management session and socket");
+        (None, None)
+    };
     let delivery_handle = tokio::spawn(webhook::delivery_loop(
         cfg.webhook.clone(),
         store.clone(),
@@ -130,11 +142,15 @@ async fn run(cfg: config::Config) -> Result<()> {
     info!("shutdown requested");
     let _ = shutdown_tx.send(true);
 
-    if let Err(err) = refresh_handle.await {
-        error!(error = %err, "session refresh task failed");
+    if let Some(refresh_handle) = refresh_handle {
+        if let Err(err) = refresh_handle.await {
+            error!(error = %err, "session refresh task failed");
+        }
     }
-    if let Err(err) = socket_handle.await {
-        error!(error = %err, "socket supervisor task failed");
+    if let Some(socket_handle) = socket_handle {
+        if let Err(err) = socket_handle.await {
+            error!(error = %err, "socket supervisor task failed");
+        }
     }
     if let Err(err) = delivery_handle.await {
         error!(error = %err, "delivery task failed");
@@ -149,15 +165,29 @@ async fn run(cfg: config::Config) -> Result<()> {
 async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        if let Err(err) = result {
+                            warn!(error = %err, "ctrl-c handler failed");
+                        }
+                    }
+                    _ = term.recv() => {}
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "SIGTERM handler unavailable; waiting for ctrl-c only");
+                if let Err(err) = tokio::signal::ctrl_c().await {
+                    warn!(error = %err, "ctrl-c handler failed");
+                }
+            }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!(error = %err, "ctrl-c handler failed");
+        }
     }
 }
