@@ -1,12 +1,25 @@
+# syntax=docker/dockerfile:1.7
 ARG RUST_VERSION=1.93.1
 FROM rust:${RUST_VERSION}-bookworm AS build
 
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock* ./
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+	--mount=type=cache,target=/usr/local/cargo/git \
+	--mount=type=cache,target=/src/target \
+	mkdir src \
+	&& printf 'fn main() {}\n' > src/main.rs \
+	&& cargo build --release --locked \
+	&& rm -rf src
+
 COPY src ./src
 
-RUN cargo build --release --locked
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+	--mount=type=cache,target=/usr/local/cargo/git \
+	--mount=type=cache,target=/src/target \
+	cargo build --release --locked \
+	&& cp /src/target/release/ptchan-gateway /usr/local/bin/ptchan-gateway
 
 FROM debian:bookworm-slim
 
@@ -16,7 +29,7 @@ RUN apt-get update \
 	&& mkdir -p /data /etc/ptchan-gateway \
 	&& chown -R 65532:65532 /data /etc/ptchan-gateway
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=build /src/target/release/ptchan-gateway /usr/local/bin/ptchan-gateway
+COPY --from=build /usr/local/bin/ptchan-gateway /usr/local/bin/ptchan-gateway
 
 USER 65532:65532
 

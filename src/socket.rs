@@ -1,22 +1,26 @@
 use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread,
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use futures_util::{SinkExt, StreamExt};
 use reqwest::Url;
-use rust_socketio::{ClientBuilder, Event, Payload, RawClient, TransportType};
 use serde_json::{json, Value};
 use tokio::{
     sync::{watch, Notify},
     time,
 };
-use tracing::{debug, error, info, warn};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        http::header::{COOKIE, ORIGIN, USER_AGENT},
+        Message,
+    },
+};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::{PtchanConfig, WebhookConfig},
@@ -56,28 +60,20 @@ pub(crate) async fn supervise(supervisor: Supervisor, mut shutdown: watch::Recei
             continue;
         }
         metrics::SOCKET_CONNECTION_ATTEMPTS.inc();
-        let stop_socket = Arc::new(AtomicBool::new(false));
         let once_supervisor = supervisor.clone();
-        let once_stop = stop_socket.clone();
         debug!(delay = ?delay, room = ROOM, "starting socket connection attempt");
-        let mut handle =
-            tokio::task::spawn_blocking(move || run_socket_once(once_supervisor, once_stop));
 
         let result = tokio::select! {
-            result = &mut handle => result,
+            result = run_socket_once(once_supervisor) => result,
             _ = shutdown.changed() => {
-                stop_socket.store(true, Ordering::Relaxed);
                 supervisor.status.set_upstream_joined(false);
-                if let Err(err) = handle.await {
-                    error!(error = %err, "socket task failed during shutdown");
-                }
                 return;
             }
         };
 
         supervisor.status.set_upstream_joined(false);
         match result {
-            Ok(Ok(joined)) => {
+            Ok(joined) => {
                 if joined {
                     delay = supervisor.cfg.socket_reconnect_min;
                 } else {
@@ -86,8 +82,7 @@ pub(crate) async fn supervise(supervisor: Supervisor, mut shutdown: watch::Recei
                 }
                 info!("socket connection ended");
             }
-            Ok(Err(err)) => warn!(error = %err, "socket connection failed"),
-            Err(err) => error!(error = %err, "socket task panicked"),
+            Err(err) => warn!(error = %err, "socket connection failed"),
         }
 
         tokio::select! {
@@ -98,73 +93,254 @@ pub(crate) async fn supervise(supervisor: Supervisor, mut shutdown: watch::Recei
     }
 }
 
-// This runs in a blocking task; owning Supervisor keeps the socket callbacks 'static.
 #[allow(clippy::needless_pass_by_value)]
-fn run_socket_once(supervisor: Supervisor, stop: Arc<AtomicBool>) -> Result<bool> {
-    let closed = Arc::new(AtomicBool::new(false));
-    let joined = Arc::new(AtomicBool::new(false));
-    let close_flag = closed.clone();
-    let joined_flag = joined.clone();
-    let joined_status = supervisor.status.clone();
+async fn run_socket_once(supervisor: Supervisor) -> Result<bool> {
     let base_url = supervisor.cfg.base_url.clone();
     let origin = socket_origin(&supervisor.cfg.base_url)?;
-    let event_store = supervisor.store.clone();
-    let event_webhooks = supervisor.webhooks;
-    let event_fingerprint_secret = supervisor.fingerprint_secret;
-    let event_wakeup = supervisor.delivery_wakeup;
+    let socket_url = socket_url(&supervisor.cfg.base_url)?;
+    let mut request = socket_url
+        .into_client_request()
+        .context("build socket request")?;
+    let headers = request.headers_mut();
+    headers.insert(
+        USER_AGENT,
+        supervisor
+            .cfg
+            .user_agent
+            .parse()
+            .context("build socket user-agent header")?,
+    );
+    headers.insert(
+        ORIGIN,
+        origin.parse().context("build socket origin header")?,
+    );
+    headers.insert(
+        COOKIE,
+        supervisor
+            .cookie
+            .get()
+            .parse()
+            .context("build socket cookie header")?,
+    );
 
     debug!(room = ROOM, base_url = %supervisor.cfg.base_url, "connecting socket");
-    let client = ClientBuilder::new(supervisor.cfg.base_url.clone())
-        // Let our supervisor reconnect so each attempt gets the latest session cookie.
-        .reconnect(false)
-        .transport_type(TransportType::Websocket)
-        .opening_header("user-agent", supervisor.cfg.user_agent.clone())
-        .opening_header("origin", origin)
-        .opening_header("cookie", supervisor.cookie.get())
-        .on(Event::Connect, |_payload: Payload, socket: RawClient| {
-            if let Err(err) = socket.emit("room", json!(ROOM)) {
-                warn!(error = %err, room = ROOM, "socket room join emit failed");
-            } else {
-                info!(room = ROOM, "socket connected; room join emitted");
+    let (mut socket, _response) = connect_async(request).await.context("connect socket")?;
+    let _connection_guard = SocketConnectionGuard::new();
+    let mut joined = false;
+
+    while supervisor.status.auth_healthy() {
+        let message = tokio::select! {
+            message = socket.next() => message,
+            () = time::sleep(Duration::from_secs(1)) => continue,
+        };
+        let Some(message) = message else {
+            info!("socket closed");
+            break;
+        };
+        let message = message.context("read socket message")?;
+        match message {
+            Message::Text(text) => {
+                match handle_socket_text(&text, &mut socket, &supervisor, &base_url, &mut joined)
+                    .await?
+                {
+                    SocketTextResult::Continue => {}
+                    SocketTextResult::RoomJoinEmitted => {
+                        info!(room = ROOM, "socket connected; room join emitted");
+                    }
+                    SocketTextResult::Closed => {
+                        info!("socket closed");
+                        break;
+                    }
+                }
             }
-        })
-        .on("message", move |payload: Payload, _socket: RawClient| {
-            if message_is_joined(&payload) {
-                joined_flag.store(true, Ordering::Relaxed);
-                joined_status.set_upstream_joined(true);
+            Message::Binary(_) => debug!("socket binary message ignored"),
+            Message::Ping(payload) => socket
+                .send(Message::Pong(payload))
+                .await
+                .context("send websocket pong")?,
+            Message::Close(frame) => {
+                if let Some(frame) = frame {
+                    info!(
+                        close_code = %frame.code,
+                        close_reason = %capped(&frame.reason),
+                        "socket closed"
+                    );
+                } else {
+                    info!("socket closed");
+                }
+                break;
+            }
+            Message::Pong(_) | Message::Frame(_) => {}
+        }
+    }
+    let _ = socket.close(None).await;
+    Ok(joined)
+}
+
+enum SocketTextResult {
+    Continue,
+    RoomJoinEmitted,
+    Closed,
+}
+
+struct SocketConnectionGuard {
+    started_at: Instant,
+}
+
+impl SocketConnectionGuard {
+    fn new() -> Self {
+        metrics::SOCKET_ACTIVE_CONNECTIONS.inc();
+        Self {
+            started_at: Instant::now(),
+        }
+    }
+}
+
+impl Drop for SocketConnectionGuard {
+    fn drop(&mut self) {
+        metrics::SOCKET_ACTIVE_CONNECTIONS.dec();
+        metrics::SOCKET_CONNECTION_SECONDS.observe(self.started_at.elapsed().as_secs_f64());
+    }
+}
+
+async fn handle_socket_text<S>(
+    text: &str,
+    socket: &mut S,
+    supervisor: &Supervisor,
+    base_url: &str,
+    joined: &mut bool,
+) -> Result<SocketTextResult>
+where
+    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let Some((engine_packet, rest)) = text.split_at_checked(1) else {
+        warn!("socket packet was empty");
+        return Ok(SocketTextResult::Continue);
+    };
+    match engine_packet {
+        "0" => {
+            socket
+                .send(Message::Text("40".into()))
+                .await
+                .context("send socket namespace connect")?;
+        }
+        "2" => {
+            socket
+                .send(Message::Text("3".into()))
+                .await
+                .context("send engine.io pong")?;
+        }
+        "4" => return handle_socketio_text(rest, socket, supervisor, base_url, joined).await,
+        "1" => {
+            info!("socket engine close packet received");
+            return Ok(SocketTextResult::Closed);
+        }
+        _ => {
+            debug!(packet = engine_packet, "socket engine packet ignored");
+        }
+    }
+    Ok(SocketTextResult::Continue)
+}
+
+async fn handle_socketio_text<S>(
+    text: &str,
+    socket: &mut S,
+    supervisor: &Supervisor,
+    base_url: &str,
+    joined: &mut bool,
+) -> Result<SocketTextResult>
+where
+    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let Some((packet, payload)) = text.split_at_checked(1) else {
+        warn!("socket.io packet was empty");
+        return Ok(SocketTextResult::Continue);
+    };
+    match packet {
+        "0" => {
+            socket
+                .send(Message::Text(format!("42{}", json!(["room", ROOM])).into()))
+                .await
+                .context("send socket room join")?;
+            Ok(SocketTextResult::RoomJoinEmitted)
+        }
+        "1" => {
+            info!(
+                payload_bytes = payload.len(),
+                "socket.io disconnect packet received"
+            );
+            Ok(SocketTextResult::Closed)
+        }
+        "2" => {
+            handle_socket_event(payload, supervisor, base_url, joined).await?;
+            Ok(SocketTextResult::Continue)
+        }
+        "4" => {
+            warn!(payload_bytes = payload.len(), "socket error");
+            Ok(SocketTextResult::Continue)
+        }
+        _ => {
+            debug!(packet, "socket.io packet ignored");
+            Ok(SocketTextResult::Continue)
+        }
+    }
+}
+
+async fn handle_socket_event(
+    payload: &str,
+    supervisor: &Supervisor,
+    base_url: &str,
+    joined: &mut bool,
+) -> Result<()> {
+    let values = match serde_json::from_str::<Vec<Value>>(payload) {
+        Ok(values) => values,
+        Err(err) => {
+            warn!(error = %err, payload_bytes = payload.len(), "socket event parse failed");
+            return Ok(());
+        }
+    };
+    let Some(event) = values.first().and_then(Value::as_str) else {
+        warn!(payload = %event_values_debug(&values), "socket event missing name");
+        return Ok(());
+    };
+    let event_payload = &values[1..];
+    match event {
+        "message" => {
+            if message_is_joined(event_payload) {
+                *joined = true;
+                supervisor.status.set_upstream_joined(true);
+                metrics::observe_now(&metrics::SOCKET_LAST_JOIN_TIMESTAMP_SECONDS);
                 info!(room = ROOM, "socket room joined");
             }
-        })
-        .on("newPost", move |payload: Payload, _socket: RawClient| {
+        }
+        "newPost" => {
             handle_new_post(
-                &base_url,
-                payload,
-                &event_store,
-                &event_webhooks,
-                event_fingerprint_secret.as_deref(),
-                &event_wakeup,
-            );
-        })
-        .on("error", |payload: Payload, _socket: RawClient| {
-            warn!(payload = ?safe_payload_debug(&payload), "socket error");
-        })
-        .on("close", move |_payload: Payload, _socket: RawClient| {
-            close_flag.store(true, Ordering::Relaxed);
-            info!("socket closed");
-        })
-        .connect()
-        .context("connect socket")?;
+                base_url.to_string(),
+                event_payload.to_vec(),
+                supervisor.store.clone(),
+                supervisor.webhooks.clone(),
+                supervisor.fingerprint_secret.clone(),
+                supervisor.delivery_wakeup.clone(),
+            )
+            .await?;
+        }
+        _ => debug!(event, payload = %event_values_debug(event_payload), "socket event ignored"),
+    }
+    Ok(())
+}
 
-    while !closed.load(Ordering::Relaxed)
-        && !stop.load(Ordering::Relaxed)
-        && supervisor.status.auth_healthy()
-    {
-        thread::sleep(Duration::from_secs(1));
-    }
-    if stop.load(Ordering::Relaxed) || !supervisor.status.auth_healthy() {
-        let _ = client.disconnect();
-    }
-    Ok(joined.load(Ordering::Relaxed))
+fn socket_url(base_url: &str) -> Result<String> {
+    let mut url = Url::parse(base_url).context("parse ptchan base url for socket")?;
+    let scheme = match url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        other => anyhow::bail!("unsupported ptchan socket scheme {other}"),
+    };
+    url.set_scheme(scheme)
+        .map_err(|()| anyhow::anyhow!("set ptchan socket scheme"))?;
+    url.set_path("/socket.io/");
+    url.set_query(Some("EIO=4&transport=websocket"));
+    Ok(url.to_string())
 }
 
 fn socket_origin(base_url: &str) -> Result<String> {
@@ -179,9 +355,31 @@ fn socket_origin(base_url: &str) -> Result<String> {
     Ok(format!("{scheme}://{host}:{port}"))
 }
 
-fn handle_new_post(
+async fn handle_new_post(
+    base_url: String,
+    payload: Vec<Value>,
+    store: Arc<Store>,
+    webhooks: Vec<WebhookConfig>,
+    fingerprint_secret: Option<String>,
+    delivery_wakeup: Arc<Notify>,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        handle_new_post_blocking(
+            &base_url,
+            &payload,
+            &store,
+            &webhooks,
+            fingerprint_secret.as_deref(),
+            &delivery_wakeup,
+        );
+    })
+    .await
+    .context("socket event processing task panicked")
+}
+
+fn handle_new_post_blocking(
     base_url: &str,
-    payload: Payload,
+    payload: &[Value],
     store: &Store,
     webhooks: &[WebhookConfig],
     fingerprint_secret: Option<&str>,
@@ -238,6 +436,7 @@ fn handle_new_post(
             match store.create_event(&built.event, &built.payload, &deliveries) {
                 Ok(true) => {
                     metrics::SOCKET_EVENTS.with_label_values(&["queued"]).inc();
+                    metrics::observe_now(&metrics::SOCKET_LAST_EVENT_TIMESTAMP_SECONDS);
                     info!(
                         event_id = %built.event.event_id,
                         kind = %built.event.kind,
@@ -311,38 +510,25 @@ fn webhook_allowed_for_board(webhook: &WebhookConfig, board: &str) -> bool {
             .any(|allowed_board| allowed_board == board)
 }
 
-fn payload_first_json(payload: Payload) -> Option<Value> {
-    match payload {
-        Payload::Text(values) => values.into_iter().next(),
-        _ => None,
-    }
+fn payload_first_json(payload: &[Value]) -> Option<Value> {
+    payload.first()?.as_object()?;
+    payload.first().cloned()
 }
 
-fn message_is_joined(payload: &Payload) -> bool {
-    match payload {
-        Payload::Text(values) => values.iter().any(|v| v.as_str() == Some("joined")),
-        _ => false,
-    }
+fn message_is_joined(payload: &[Value]) -> bool {
+    payload.iter().any(|v| v.as_str() == Some("joined"))
 }
 
-// rust_socketio still exposes a deprecated payload variant, so keep this broad.
-#[allow(clippy::match_wildcard_for_single_variants)]
-fn safe_payload_debug(payload: &Payload) -> String {
-    match payload {
-        Payload::Text(values) => {
-            let Some(value) = values.first() else {
-                return "text_values=0".to_string();
-            };
-            match value {
-                Value::String(text) => format!("text={}", capped(text)),
-                Value::Number(number) => format!("number={number}"),
-                Value::Bool(value) => format!("bool={value}"),
-                Value::Null => "null".to_string(),
-                Value::Array(_) | Value::Object(_) => format!("text_values={}", values.len()),
-            }
-        }
-        Payload::Binary(bytes) => format!("binary_len={}", bytes.len()),
-        _ => "unknown_payload".to_string(),
+fn event_values_debug(values: &[Value]) -> String {
+    let Some(value) = values.first() else {
+        return "values=0".to_string();
+    };
+    match value {
+        Value::String(text) => format!("string_len={}", text.len()),
+        Value::Number(number) => format!("number={number}"),
+        Value::Bool(value) => format!("bool={value}"),
+        Value::Null => "null".to_string(),
+        Value::Array(_) | Value::Object(_) => format!("values={}", values.len()),
     }
 }
 
@@ -374,6 +560,7 @@ fn json_shape(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::contract::{EventKind, Post, WebhookEvent};
+    use std::time::Duration;
 
     #[test]
     fn event_deliveries_respects_allowed_boards() {
@@ -402,6 +589,28 @@ mod tests {
 
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].webhook, "all");
+    }
+
+    #[test]
+    fn socket_url_uses_engineio_websocket_endpoint() {
+        assert_eq!(
+            socket_url("https://ptchan.test").unwrap(),
+            "wss://ptchan.test/socket.io/?EIO=4&transport=websocket"
+        );
+        assert_eq!(
+            socket_url("http://ptchan.test/base").unwrap(),
+            "ws://ptchan.test/socket.io/?EIO=4&transport=websocket"
+        );
+    }
+
+    #[test]
+    fn socket_payload_helpers_read_expected_values() {
+        let object = json!({"postId": 123});
+        let values = vec![object.clone()];
+
+        assert_eq!(payload_first_json(&values), Some(object));
+        assert!(message_is_joined(&[json!("ignored"), json!("joined")]));
+        assert!(!message_is_joined(&[json!("not joined")]));
     }
 
     fn built_event(board: &str) -> event::BuiltEvent {

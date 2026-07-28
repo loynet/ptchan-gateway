@@ -307,9 +307,12 @@ File uploads and new thread creation are not part of the current write surface.
 - Upstream socket/session health: `ptchan_upstream_required`,
   `ptchan_upstream_auth_healthy`, `ptchan_socket_joined`,
   `ptchan_socket_connection_attempts_total`,
-  `ptchan_socket_join_failures_total`, `ptchan_session_refresh_total`.
+  `ptchan_socket_active_connections`, `ptchan_socket_connection_seconds`,
+  `ptchan_socket_join_failures_total`,
+  `ptchan_socket_last_join_timestamp_seconds`, `ptchan_session_refresh_total`,
+  and `ptchan_session_expires_at_seconds`.
 - Event intake and privacy filtering: `ptchan_socket_events_total`,
-  `ptchan_redaction_drops_total`.
+  `ptchan_socket_last_event_timestamp_seconds`, `ptchan_redaction_drops_total`.
 - Webhook backlog and delivery behavior: `ptchan_webhook_pending`,
   `ptchan_webhook_pending_by_webhook`, `ptchan_webhook_deliveries_total`,
   `ptchan_webhook_delivery_seconds`.
@@ -320,10 +323,13 @@ File uploads and new thread creation are not part of the current write surface.
   `ptchan_gateway_rate_limited_requests_total`, labeled by integration, board,
   capability, and scope (`integration` or `global`).
 - Storage health: `ptchan_sqlite_errors_total`.
-- Gateway process health on Linux/container deployments:
+- Gateway process health on Linux/container deployments. The standard
+  Prometheus process collector exposes:
   `process_cpu_seconds_total`, `process_resident_memory_bytes`,
   `process_virtual_memory_bytes`, `process_open_fds`, `process_max_fds`,
-  `process_threads`, and `process_start_time_seconds`.
+  `process_threads`, and `process_start_time_seconds`. The gateway also exposes
+  Linux `/proc` fallback gauges: `ptchan_process_cpu_ticks_total`,
+  `ptchan_process_threads`, and `ptchan_process_open_fds`.
 
 Metrics must not expose cookies, signatures, raw upstream payloads, poster
 fingerprints, moderation identity fields, or per-poster labels.

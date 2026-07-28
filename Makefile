@@ -61,7 +61,7 @@ doctor:
 	@printf 'cargo-deny: '; if command -v cargo-deny >/dev/null 2>&1; then cargo deny --version; else printf '%s\n' 'missing'; fi
 
 docker-build:
-	docker build --pull -t $(IMAGE) .
+	DOCKER_BUILDKIT=1 docker build --pull -t $(IMAGE) .
 
 docker-run:
 	docker run -d \

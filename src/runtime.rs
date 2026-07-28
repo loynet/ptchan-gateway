@@ -1064,7 +1064,6 @@ mod tests {
         let cfg = PtchanConfig {
             base_url: "https://ptchan.test".to_string(),
             user_agent: "ptchan-gateway-test".to_string(),
-            session_refresh_fallback_interval: Duration::from_mins(1),
             socket_reconnect_min: Duration::from_secs(1),
             socket_reconnect_max: Duration::from_secs(2),
         };

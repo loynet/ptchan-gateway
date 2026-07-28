@@ -4,8 +4,10 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
+use serde_json::Value;
 use tokio::{sync::watch, time};
 use tracing::{debug, info, warn};
 
@@ -60,10 +62,6 @@ impl SessionCookie {
             .iter()
             .filter_map(|cookie| cookie.expires_at)
             .min()
-    }
-
-    fn is_usable_at(&self, now: DateTime<Utc>) -> bool {
-        self.expires_at().is_none_or(|expires_at| expires_at > now)
     }
 
     fn merge(&self, updates: Vec<ParsedCookieHeader>, now: DateTime<Utc>) -> bool {
@@ -185,41 +183,49 @@ pub(crate) async fn refresh_loop(
         }
         let sleep_for = match refresh_once(&client, &cfg, &cookie).await {
             Ok(updated) => {
-                status.set_auth_healthy(true);
-                metrics::SESSION_REFRESH
-                    .with_label_values(&["success"])
-                    .inc();
-                let sleep_for =
-                    next_refresh_delay(&cookie, cfg.session_refresh_fallback_interval, Utc::now());
                 let expires_at = cookie.expires_at();
-                if updated {
-                    info!(?expires_at, ?sleep_for, "ptchan session cookie refreshed");
-                } else {
-                    info!(?expires_at, ?sleep_for, "ptchan session refresh ok");
+                match next_refresh_delay(&cookie, Utc::now()) {
+                    Ok(sleep_for) => {
+                        status.set_auth_healthy(true);
+                        if let Some(expires_at) = expires_at {
+                            metrics::SESSION_EXPIRES_AT_SECONDS.set(expires_at.timestamp());
+                        }
+                        metrics::SESSION_REFRESH
+                            .with_label_values(&["success"])
+                            .inc();
+                        if updated {
+                            info!(?expires_at, ?sleep_for, "ptchan session cookie refreshed");
+                        } else {
+                            info!(?expires_at, ?sleep_for, "ptchan session refresh ok");
+                        }
+                        sleep_for
+                    }
+                    Err(err) => refresh_failed(&status, &cookie, &err),
                 }
-                sleep_for
             }
-            Err(err) => {
-                let auth_healthy = status.auth_healthy() && cookie.is_usable_at(Utc::now());
-                status.set_auth_healthy(auth_healthy);
-                metrics::SESSION_REFRESH
-                    .with_label_values(&["failure"])
-                    .inc();
-                warn!(
-                    error = %err,
-                    auth_healthy,
-                    retry_in = ?SESSION_REFRESH_RETRY_INTERVAL,
-                    expires_at = ?cookie.expires_at(),
-                    "ptchan session refresh failed"
-                );
-                SESSION_REFRESH_RETRY_INTERVAL
-            }
+            Err(err) => refresh_failed(&status, &cookie, &err),
         };
         tokio::select! {
             _ = shutdown.changed() => {}
             () = time::sleep(sleep_for) => {}
         }
     }
+}
+
+fn refresh_failed(status: &Status, cookie: &SessionCookie, err: &anyhow::Error) -> Duration {
+    status.set_auth_healthy(false);
+    metrics::SESSION_EXPIRES_AT_SECONDS.set(0);
+    metrics::SESSION_REFRESH
+        .with_label_values(&["failure"])
+        .inc();
+    warn!(
+        error = %err,
+        auth_healthy = false,
+        retry_in = ?SESSION_REFRESH_RETRY_INTERVAL,
+        expires_at = ?cookie.expires_at(),
+        "ptchan session refresh failed"
+    );
+    SESSION_REFRESH_RETRY_INTERVAL
 }
 
 async fn refresh_once(
@@ -242,10 +248,23 @@ async fn refresh_once(
     if !status.is_success() {
         anyhow::bail!("refresh status {status}");
     }
-    let set_cookies = response.headers().get_all("set-cookie");
+    let set_cookies = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(std::borrow::ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let body = response
+        .text()
+        .await
+        .context("read refresh response body")?;
+    let body = serde_json::from_str::<Value>(&body)
+        .context("refresh response was not valid management JSON")?;
+    validate_recent_json(&body).context("refresh response was not management recent JSON")?;
+
     let mut updates = Vec::new();
     let now = Utc::now();
-    for value in set_cookies {
+    for value in &set_cookies {
         let value = value.to_str()?;
         let parsed = parse_cookie_header(value, now);
         if !parsed.value.is_empty() {
@@ -257,27 +276,46 @@ async fn refresh_once(
             set_cookie_count = updates.len(),
             "ptchan session cookie update accepted"
         );
-        return Ok(cookie.merge(updates, now));
+        let cookie_changed = cookie.merge(updates, now);
+        ensure_cookie_has_expiry(cookie)?;
+        return Ok(cookie_changed);
     }
+    ensure_cookie_has_expiry(cookie)?;
     Ok(false)
 }
 
-fn next_refresh_delay(cookie: &SessionCookie, fallback: Duration, now: DateTime<Utc>) -> Duration {
-    let Some(expires_at) = cookie.expires_at() else {
-        return fallback;
-    };
+fn ensure_cookie_has_expiry(cookie: &SessionCookie) -> anyhow::Result<()> {
+    if cookie.expires_at().is_some() {
+        Ok(())
+    } else {
+        anyhow::bail!("validated management session has no known expiry")
+    }
+}
+
+fn validate_recent_json(value: &Value) -> anyhow::Result<()> {
+    value
+        .as_array()
+        .context("management recent response was not an array")?;
+    Ok(())
+}
+
+fn next_refresh_delay(cookie: &SessionCookie, now: DateTime<Utc>) -> anyhow::Result<Duration> {
+    let expires_at = cookie
+        .expires_at()
+        .context("validated management session has no known expiry")?;
     let remaining = expires_at
         .signed_duration_since(now)
         .to_std()
         .unwrap_or(Duration::ZERO);
     let safety_margin = cmp::min(remaining / 5, SESSION_REFRESH_MAX_SAFETY_MARGIN);
-    remaining.saturating_sub(safety_margin)
+    Ok(remaining.saturating_sub(safety_margin))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use serde_json::json;
 
     #[test]
     fn strips_set_cookie_attributes_and_keeps_expiry() {
@@ -367,19 +405,34 @@ mod tests {
         let cookie = SessionCookie::new("session=s%3Aabc; Expires=Wed, 22 Jul 2026 12:00:00 GMT");
 
         assert_eq!(
-            next_refresh_delay(&cookie, Duration::from_hours(12), now),
+            next_refresh_delay(&cookie, now).unwrap(),
             Duration::from_hours((3 * 24) - 1)
         );
     }
 
     #[test]
-    fn refresh_delay_falls_back_without_expiry() {
+    fn refresh_delay_rejects_cookies_without_expiry() {
         let now = Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 0).unwrap();
         let cookie = SessionCookie::new("session=s%3Aabc");
 
-        assert_eq!(
-            next_refresh_delay(&cookie, Duration::from_hours(12), now),
-            Duration::from_hours(12)
-        );
+        assert!(next_refresh_delay(&cookie, now).is_err());
+        assert!(ensure_cookie_has_expiry(&cookie).is_err());
+    }
+
+    #[test]
+    fn recent_json_validation_accepts_recent_post_arrays() {
+        validate_recent_json(&json!([
+            {
+                "board": "test",
+                "postId": 123
+            }
+        ]))
+        .unwrap();
+        validate_recent_json(&json!([])).unwrap();
+    }
+
+    #[test]
+    fn recent_json_validation_rejects_login_or_wrong_shape() {
+        assert!(validate_recent_json(&json!({"login": true})).is_err());
     }
 }

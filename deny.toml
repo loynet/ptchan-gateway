@@ -8,14 +8,6 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-    # rust_socketio 0.6.0 depends on backoff 0.4, which is unmaintained and
-    # pulls instant 0.1. There is no safe rust_socketio upgrade today; replacing
-    # the Socket.IO client is tracked as a follow-up because ptchan requires
-    # Socket.IO client protocol compatibility.
-    "RUSTSEC-2025-0012",
-    "RUSTSEC-2024-0384",
-]
 
 [licenses]
 version = 2

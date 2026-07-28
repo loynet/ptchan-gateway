@@ -30,11 +30,6 @@ pub(crate) struct PtchanConfig {
     #[serde(default = "gateway_user_agent")]
     pub(crate) user_agent: String,
     #[serde(
-        default = "default_refresh_fallback_interval",
-        deserialize_with = "duration_from_str"
-    )]
-    pub(crate) session_refresh_fallback_interval: Duration,
-    #[serde(
         default = "default_reconnect_min",
         deserialize_with = "duration_from_str"
     )]
@@ -386,11 +381,6 @@ impl Config {
         if self.ptchan.user_agent.trim().is_empty() {
             return Err(anyhow!("ptchan.user_agent is required"));
         }
-        if self.ptchan.session_refresh_fallback_interval.is_zero() {
-            return Err(anyhow!(
-                "ptchan.session_refresh_fallback_interval must be greater than zero"
-            ));
-        }
         if self.ptchan.socket_reconnect_min.is_zero() {
             return Err(anyhow!(
                 "ptchan.socket_reconnect_min must be greater than zero"
@@ -633,9 +623,6 @@ pub(crate) fn runtime_addr(addr: &str) -> Result<SocketAddr> {
         .with_context(|| format!("parse address {addr}"))
 }
 
-fn default_refresh_fallback_interval() -> Duration {
-    Duration::from_hours(12)
-}
 pub(crate) fn gateway_user_agent() -> String {
     format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
 }
@@ -904,7 +891,6 @@ sqlite_path = "data/test.db"
             ptchan: PtchanConfig {
                 base_url: "https://ptchan.test".to_string(),
                 user_agent: "ptchan-gateway-test".to_string(),
-                session_refresh_fallback_interval: Duration::from_hours(12),
                 socket_reconnect_min: Duration::from_secs(3),
                 socket_reconnect_max: Duration::from_mins(1),
             },
