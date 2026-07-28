@@ -18,7 +18,8 @@ COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
 	--mount=type=cache,target=/usr/local/cargo/git \
 	--mount=type=cache,target=/src/target \
-	cargo build --release --locked \
+	find src -type f -exec touch {} + \
+	&& cargo build --release --locked \
 	&& cp /src/target/release/ptchan-gateway /usr/local/bin/ptchan-gateway
 
 FROM debian:bookworm-slim
