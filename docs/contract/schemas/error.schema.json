@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ErrorEnvelope",
+  "description": "Uniform JSON body returned by integration API failures.",
+  "type": "object",
+  "properties": {
+    "error": {
+      "$ref": "#/$defs/ErrorBody"
+    }
+  },
+  "required": [
+    "error"
+  ],
+  "$defs": {
+    "ErrorBody": {
+      "description": "Stable error details for programmatic handling and operator diagnostics.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "Stable code suitable for branching.",
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "description": "Human-readable, non-sensitive explanation.",
+          "type": "string"
+        },
+        "retryable": {
+          "description": "Whether an automatic retry can be safe. `reply_state_unknown` is never retryable.",
+          "type": "boolean"
+        },
+        "upstream_status": {
+          "description": "Upstream HTTP status when ptchan returned a classified rejection.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ]
+    },
+    "ErrorCode": {
+      "description": "Stable machine-readable integration API error code.",
+      "type": "string",
+      "enum": [
+        "unauthorized",
+        "capability_not_enabled",
+        "invalid_json",
+        "invalid_query",
+        "invalid_board",
+        "invalid_thread_id",
+        "missing_message",
+        "message_too_long",
+        "invalid_message",
+        "board_not_allowed",
+        "rate_limited",
+        "thread_not_found",
+        "upstream_unavailable",
+        "captcha_required",
+        "block_bypass_required",
+        "thread_locked",
+        "thread_reply_limit",
+        "board_locked",
+        "rejected",
+        "reply_state_unknown",
+        "payload_too_large"
+      ]
+    }
+  }
+}

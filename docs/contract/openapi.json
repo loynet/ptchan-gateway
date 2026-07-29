@@ -1,0 +1,697 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "ptchan-gateway integration API",
+    "description": "Signed, moderation-safe access to ptchan threads and replies. Webhook payloads use the WebhookEvent schema. Webhook delivery is durable and at-least-once; consumers must deduplicate by event_id and tolerate delayed or out-of-order events.",
+    "license": {
+      "name": "GPL-3.0-only",
+      "identifier": "GPL-3.0-only"
+    },
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/integration/v1/threads/{board}/{thread_id}": {
+      "get": {
+        "tags": [
+          "integration"
+        ],
+        "operationId": "integration_thread",
+        "parameters": [
+          {
+            "name": "board",
+            "in": "path",
+            "description": "ptchan board name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "thread_id",
+            "in": "path",
+            "description": "Thread post ID",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Most recent posts to return; defaults to 50 and values above 200 are capped",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "x-ptchan-integration",
+            "in": "header",
+            "description": "Configured integration name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-ptchan-timestamp",
+            "in": "header",
+            "description": "RFC 3339 signing timestamp within five minutes of gateway time",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-ptchan-signature",
+            "in": "header",
+            "description": "HMAC-SHA256 signature over <timestamp>.<method>.<path-and-query>",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sanitized thread in chronological order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Thread"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid path or query value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Reading capability or board access denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Thread not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Gateway rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "ptchan could not provide the thread",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/integration/v1/threads/{board}/{thread_id}/replies": {
+      "post": {
+        "tags": [
+          "integration"
+        ],
+        "operationId": "integration_reply",
+        "parameters": [
+          {
+            "name": "board",
+            "in": "path",
+            "description": "ptchan board name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "thread_id",
+            "in": "path",
+            "description": "Thread post ID",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "x-ptchan-integration",
+            "in": "header",
+            "description": "Configured integration name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-ptchan-timestamp",
+            "in": "header",
+            "description": "RFC 3339 signing timestamp within five minutes of gateway time",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-ptchan-signature",
+            "in": "header",
+            "description": "HMAC-SHA256 signature over <timestamp>.<method>.<path-and-query>.<exact JSON body>",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Gateway-owned public reply fields",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Reply accepted and post coordinates decoded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid JSON or reply fields",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Posting capability or board access denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Thread not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the gateway body limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Gateway or upstream rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream rejected the reply or its final state is unknown",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorBody": {
+        "type": "object",
+        "description": "Stable error details for programmatic handling and operator diagnostics.",
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode",
+            "description": "Stable code suitable for branching."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable, non-sensitive explanation."
+          },
+          "retryable": {
+            "type": "boolean",
+            "description": "Whether an automatic retry can be safe. `reply_state_unknown` is never retryable."
+          },
+          "upstream_status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Upstream HTTP status when ptchan returned a classified rejection.",
+            "minimum": 0
+          }
+        }
+      },
+      "ErrorCode": {
+        "type": "string",
+        "description": "Stable machine-readable integration API error code.",
+        "enum": [
+          "unauthorized",
+          "capability_not_enabled",
+          "invalid_json",
+          "invalid_query",
+          "invalid_board",
+          "invalid_thread_id",
+          "missing_message",
+          "message_too_long",
+          "invalid_message",
+          "board_not_allowed",
+          "rate_limited",
+          "thread_not_found",
+          "upstream_unavailable",
+          "captcha_required",
+          "block_bypass_required",
+          "thread_locked",
+          "thread_reply_limit",
+          "board_locked",
+          "rejected",
+          "reply_state_unknown",
+          "payload_too_large"
+        ]
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "description": "Uniform JSON body returned by integration API failures.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorBody"
+          }
+        }
+      },
+      "EventKind": {
+        "type": "string",
+        "description": "Public post event kind.",
+        "enum": [
+          "thread.created",
+          "post.created"
+        ]
+      },
+      "OriginKind": {
+        "type": "string",
+        "description": "Supported producer categories.",
+        "enum": [
+          "integration"
+        ]
+      },
+      "Post": {
+        "type": "object",
+        "description": "Moderation-safe public post returned to integrations.",
+        "required": [
+          "board",
+          "thread_id",
+          "post_id",
+          "url",
+          "date",
+          "attachment_count"
+        ],
+        "properties": {
+          "attachment_count": {
+            "type": "integer",
+            "description": "Number of public attachments; attachment metadata is not exposed.",
+            "minimum": 0
+          },
+          "board": {
+            "type": "string",
+            "description": "ptchan board name."
+          },
+          "capcode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Public capcode, omitted when absent."
+          },
+          "country": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Public country code, omitted when absent."
+          },
+          "date": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Upstream post timestamp."
+          },
+          "donor": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Public donor marker, omitted when upstream does not provide it."
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Plain public message, omitted when absent."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Public display name, omitted when absent."
+          },
+          "origin": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PostOrigin",
+                "description": "Integration identity inferred from an exact configured public-tripcode match."
+              }
+            ]
+          },
+          "post_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Post ID."
+          },
+          "poster_fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional integration-scoped pseudonym; never an upstream cloak."
+          },
+          "referenced_by": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PostRef"
+            },
+            "description": "Posts that quote this post."
+          },
+          "references": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PostRef"
+            },
+            "description": "Posts quoted by this post."
+          },
+          "subject": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Public subject, omitted when absent."
+          },
+          "thread_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Post ID of the containing thread."
+          },
+          "tripcode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Public tripcode emitted by ptchan, never the tripcode secret."
+          },
+          "url": {
+            "type": "string",
+            "description": "Canonical public post URL."
+          }
+        }
+      },
+      "PostOrigin": {
+        "type": "object",
+        "description": "Gateway-known producer of a post.",
+        "required": [
+          "kind",
+          "name"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/OriginKind",
+            "description": "Producer category."
+          },
+          "name": {
+            "type": "string",
+            "description": "Configured integration name."
+          }
+        }
+      },
+      "PostRef": {
+        "type": "object",
+        "description": "Complete coordinates for a quoted post.",
+        "required": [
+          "board",
+          "thread_id",
+          "post_id"
+        ],
+        "properties": {
+          "board": {
+            "type": "string",
+            "description": "ptchan board name."
+          },
+          "post_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Referenced post ID."
+          },
+          "thread_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Containing thread post ID."
+          }
+        }
+      },
+      "ReplyRequest": {
+        "type": "object",
+        "description": "Signed request body for creating a public reply.",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "Public post body, limited to 8,000 UTF-8 bytes."
+          },
+          "sage": {
+            "type": "boolean",
+            "description": "Whether to submit `sage` through the public posting form."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ReplyResponse": {
+        "type": "object",
+        "description": "Coordinates returned after ptchan accepts and identifies a reply.",
+        "required": [
+          "board",
+          "thread_id",
+          "post_id",
+          "url",
+          "origin"
+        ],
+        "properties": {
+          "board": {
+            "type": "string",
+            "description": "ptchan board name."
+          },
+          "origin": {
+            "$ref": "#/components/schemas/PostOrigin",
+            "description": "Integration that submitted the reply."
+          },
+          "post_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Created post ID."
+          },
+          "thread_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Containing thread post ID."
+          },
+          "url": {
+            "type": "string",
+            "description": "Canonical public post URL."
+          }
+        }
+      },
+      "SchemaVersion": {
+        "type": "string",
+        "description": "Version of the integration-facing JSON schema.",
+        "enum": [
+          "1"
+        ]
+      },
+      "Thread": {
+        "type": "object",
+        "description": "Sanitized thread returned by the signed reading endpoint.",
+        "required": [
+          "board",
+          "thread_id",
+          "posts",
+          "truncated"
+        ],
+        "properties": {
+          "board": {
+            "type": "string",
+            "description": "ptchan board name."
+          },
+          "posts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Post"
+            },
+            "description": "Selected posts in chronological order."
+          },
+          "thread_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Thread post ID."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Whether older posts were omitted by the requested limit."
+          }
+        }
+      },
+      "WebhookEvent": {
+        "type": "object",
+        "description": "Durable event delivered to one configured integration webhook.",
+        "required": [
+          "schema_version",
+          "event_id",
+          "kind",
+          "source",
+          "observed_at",
+          "post"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "description": "Stable idempotency key, also sent as `x-ptchan-event-id`."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/EventKind",
+            "description": "Public event kind."
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Time at which the gateway accepted the upstream event."
+          },
+          "post": {
+            "$ref": "#/components/schemas/Post",
+            "description": "Sanitized public post."
+          },
+          "schema_version": {
+            "$ref": "#/components/schemas/SchemaVersion",
+            "description": "Schema used to encode this event."
+          },
+          "source": {
+            "type": "string",
+            "description": "Upstream service that produced the event."
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "integration",
+      "description": "Signed integration-facing API"
+    }
+  ]
+}

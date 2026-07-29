@@ -1,0 +1,24 @@
+{
+  "board": "test",
+  "thread_id": 397,
+  "posts": [
+    {
+      "board": "test",
+      "thread_id": 397,
+      "post_id": 399,
+      "url": "https://ptchan.org/test/thread/397.html#399",
+      "date": "2026-07-19T12:00:00Z",
+      "message": ">>397\nhello from the integration",
+      "name": "gateway",
+      "tripcode": "!!X8NXmAS44=",
+      "donor": false,
+      "country": "PT",
+      "origin": {
+        "kind": "integration",
+        "name": "example"
+      },
+      "attachment_count": 0
+    }
+  ],
+  "truncated": false
+}

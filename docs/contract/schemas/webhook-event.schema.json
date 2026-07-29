@@ -1,0 +1,245 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WebhookEvent",
+  "description": "Durable event delivered to one configured integration webhook.",
+  "type": "object",
+  "properties": {
+    "event_id": {
+      "description": "Stable idempotency key, also sent as `x-ptchan-event-id`.",
+      "type": "string"
+    },
+    "kind": {
+      "description": "Public event kind.",
+      "$ref": "#/$defs/EventKind"
+    },
+    "observed_at": {
+      "description": "Time at which the gateway accepted the upstream event.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "post": {
+      "description": "Sanitized public post.",
+      "$ref": "#/$defs/Post"
+    },
+    "schema_version": {
+      "description": "Schema used to encode this event.",
+      "$ref": "#/$defs/SchemaVersion"
+    },
+    "source": {
+      "description": "Upstream service that produced the event.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "event_id",
+    "kind",
+    "source",
+    "observed_at",
+    "post"
+  ],
+  "$defs": {
+    "EventKind": {
+      "description": "Public post event kind.",
+      "oneOf": [
+        {
+          "description": "A new thread was created.",
+          "type": "string",
+          "const": "thread.created"
+        },
+        {
+          "description": "A reply was added to an existing thread.",
+          "type": "string",
+          "const": "post.created"
+        }
+      ]
+    },
+    "OriginKind": {
+      "description": "Supported producer categories.",
+      "oneOf": [
+        {
+          "description": "A configured gateway integration.",
+          "type": "string",
+          "const": "integration"
+        }
+      ]
+    },
+    "Post": {
+      "description": "Moderation-safe public post returned to integrations.",
+      "type": "object",
+      "properties": {
+        "attachment_count": {
+          "description": "Number of public attachments; attachment metadata is not exposed.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "board": {
+          "description": "ptchan board name.",
+          "type": "string"
+        },
+        "capcode": {
+          "description": "Public capcode, omitted when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "country": {
+          "description": "Public country code, omitted when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "date": {
+          "description": "Upstream post timestamp.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "donor": {
+          "description": "Public donor marker, omitted when upstream does not provide it.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "message": {
+          "description": "Plain public message, omitted when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Public display name, omitted when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "origin": {
+          "description": "Integration identity inferred from an exact configured public-tripcode match.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PostOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "post_id": {
+          "description": "Post ID.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "poster_fingerprint": {
+          "description": "Optional integration-scoped pseudonym; never an upstream cloak.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "referenced_by": {
+          "description": "Posts that quote this post.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PostRef"
+          }
+        },
+        "references": {
+          "description": "Posts quoted by this post.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PostRef"
+          }
+        },
+        "subject": {
+          "description": "Public subject, omitted when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_id": {
+          "description": "Post ID of the containing thread.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "tripcode": {
+          "description": "Public tripcode emitted by ptchan, never the tripcode secret.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "description": "Canonical public post URL.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "board",
+        "thread_id",
+        "post_id",
+        "url",
+        "date",
+        "attachment_count"
+      ]
+    },
+    "PostOrigin": {
+      "description": "Gateway-known producer of a post.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "Producer category.",
+          "$ref": "#/$defs/OriginKind"
+        },
+        "name": {
+          "description": "Configured integration name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "name"
+      ]
+    },
+    "PostRef": {
+      "description": "Complete coordinates for a quoted post.",
+      "type": "object",
+      "properties": {
+        "board": {
+          "description": "ptchan board name.",
+          "type": "string"
+        },
+        "post_id": {
+          "description": "Referenced post ID.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "thread_id": {
+          "description": "Containing thread post ID.",
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "board",
+        "thread_id",
+        "post_id"
+      ]
+    },
+    "SchemaVersion": {
+      "description": "Version of the integration-facing JSON schema.",
+      "oneOf": [
+        {
+          "description": "Initial public contract.",
+          "type": "string",
+          "const": "1"
+        }
+      ]
+    }
+  }
+}

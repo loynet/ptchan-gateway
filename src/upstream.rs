@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Deserializer, Value};
 
 use crate::metrics;
 
@@ -13,8 +13,8 @@ pub(crate) struct Post {
     #[serde(default)]
     pub(crate) country: Option<Country>,
     pub(crate) board: String,
-    #[serde(default)]
-    pub(crate) tripcode: Option<String>,
+    #[serde(default, rename = "tripcode")]
+    pub(crate) public_tripcode: Option<String>,
     #[serde(default)]
     pub(crate) capcode: Option<String>,
     #[serde(default)]
@@ -71,7 +71,7 @@ pub(crate) fn assert_contract_safe(payload: &[u8]) -> Result<()> {
 
 fn post_from_value(value: &Value) -> Result<Post> {
     let text = value.to_string();
-    let mut deserializer = serde_json::Deserializer::from_str(&text);
+    let mut deserializer = Deserializer::from_str(&text);
     serde_path_to_error::deserialize(&mut deserializer)
         .map_err(|err| anyhow!("decode upstream post at {}: {}", err.path(), err.inner()))
 }

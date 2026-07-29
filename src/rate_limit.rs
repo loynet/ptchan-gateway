@@ -119,6 +119,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::config::RateLimitConfig;
 
     #[test]
     fn limits_each_integration_independently() {
@@ -149,7 +150,7 @@ mod tests {
     fn applies_global_limits_across_integrations() {
         let limiters = RateLimiters::new(
             &[integration("alpha"), integration("beta")],
-            &crate::config::RuntimeRateLimitConfig {
+            &RuntimeRateLimitConfig {
                 reading: RateLimitBucketConfig {
                     requests: 1,
                     window: Duration::from_secs(60),
@@ -183,10 +184,8 @@ mod tests {
         IntegrationConfig {
             name: name.to_string(),
             allowed_boards: Vec::new(),
-            reading: Some(crate::config::ReadingCapabilityConfig {}),
-            webhook: None,
-            posting: None,
-            rate_limit: crate::config::RateLimitConfig {
+            reading: true,
+            rate_limit: RateLimitConfig {
                 reading: RateLimitBucketConfig {
                     requests: 1,
                     window: Duration::from_secs(60),
@@ -202,8 +201,8 @@ mod tests {
         }
     }
 
-    fn runtime_limits() -> crate::config::RuntimeRateLimitConfig {
-        crate::config::RuntimeRateLimitConfig {
+    fn runtime_limits() -> RuntimeRateLimitConfig {
+        RuntimeRateLimitConfig {
             reading: RateLimitBucketConfig {
                 requests: 10,
                 window: Duration::from_secs(60),

@@ -1,4 +1,10 @@
-use std::sync::LazyLock;
+use std::{
+    sync::LazyLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(target_os = "linux")]
+use std::fs;
 
 use anyhow::{Context, Result};
 use prometheus::{
@@ -112,6 +118,13 @@ pub(crate) static WEBHOOK_PENDING_BY_WEBHOOK: LazyLock<IntGaugeVec> = LazyLock::
     )
     .unwrap()
 });
+pub(crate) static WEBHOOK_OLDEST_PENDING_SECONDS: LazyLock<Gauge> = LazyLock::new(|| {
+    prometheus::register_gauge!(
+        "ptchan_webhook_oldest_pending_seconds",
+        "Age in seconds of the oldest event with a pending webhook delivery"
+    )
+    .unwrap()
+});
 pub(crate) static WEBHOOK_DELIVERY_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     prometheus::register_histogram_vec!(
         "ptchan_webhook_delivery_seconds",
@@ -212,6 +225,7 @@ pub(crate) fn init() {
     LazyLock::force(&WEBHOOK_DELIVERIES);
     LazyLock::force(&WEBHOOK_PENDING);
     LazyLock::force(&WEBHOOK_PENDING_BY_WEBHOOK);
+    LazyLock::force(&WEBHOOK_OLDEST_PENDING_SECONDS);
     LazyLock::force(&WEBHOOK_DELIVERY_SECONDS);
     LazyLock::force(&READING_REQUESTS);
     LazyLock::force(&READING_REQUEST_SECONDS);
@@ -238,8 +252,8 @@ pub(crate) fn render() -> Result<String> {
 
 pub(crate) fn observe_now(gauge: &Gauge) {
     gauge.set(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map_or(0.0, |duration| duration.as_secs_f64()),
     );
 }
@@ -250,17 +264,17 @@ pub(crate) fn refresh_process_metrics() {
 
 #[cfg(target_os = "linux")]
 fn refresh_process_metrics_impl() {
-    if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
+    if let Ok(stat) = fs::read_to_string("/proc/self/stat") {
         if let Some(cpu_ticks) = process_cpu_ticks_from_stat(&stat) {
             PROCESS_CPU_TICKS.set(i64::try_from(cpu_ticks).unwrap_or(i64::MAX));
         }
     }
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
         if let Some(threads) = process_threads_from_status(&status) {
             PROCESS_THREADS.set(threads);
         }
     }
-    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+    if let Ok(entries) = fs::read_dir("/proc/self/fd") {
         PROCESS_OPEN_FDS.set(i64::try_from(entries.count()).unwrap_or(i64::MAX));
     }
 }

@@ -4,7 +4,10 @@ use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::Sha256;
 
-use crate::{contract, upstream};
+use crate::{
+    contract::{EventKind, Post, PostRef, SchemaVersion, WebhookEvent},
+    upstream::{self, Country, DecodedPost, Post as UpstreamPost},
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -13,18 +16,20 @@ pub(crate) fn gateway_event(
     value: Value,
     observed_at: DateTime<Utc>,
 ) -> Result<BuiltEvent> {
-    let decoded = upstream::DecodedPost::try_from(value)
-        .map_err(|err| anyhow!("decode upstream newPost: {err}"))?;
+    let decoded =
+        DecodedPost::try_from(value).map_err(|err| anyhow!("decode upstream newPost: {err}"))?;
     let poster_identity = decoded.poster_identity;
     let post = decoded.post;
     let kind = if post.thread.is_some() {
-        contract::EventKind::PostCreated
+        EventKind::PostCreated
     } else {
-        contract::EventKind::ThreadCreated
+        EventKind::ThreadCreated
     };
+
     let event_id = format!("ptchan:{}:{}:{}", kind.as_str(), post.board, post.id);
     let post = contract_post(base_url, post);
-    let event = contract::WebhookEvent {
+    let event = WebhookEvent {
+        schema_version: SchemaVersion::V1,
         event_id,
         kind,
         source: "ptchan".to_string(),
@@ -39,13 +44,13 @@ pub(crate) fn gateway_event(
     })
 }
 
-pub(crate) fn contract_post_from_value(base_url: &str, value: Value) -> Result<contract::Post> {
-    let post = upstream::DecodedPost::try_from(value)
-        .map_err(|err| anyhow!("decode upstream post: {err}"))?;
+pub(crate) fn contract_post_from_value(base_url: &str, value: Value) -> Result<Post> {
+    let post =
+        DecodedPost::try_from(value).map_err(|err| anyhow!("decode upstream post: {err}"))?;
     Ok(contract_post(base_url, post.post))
 }
 
-fn contract_post(base_url: &str, post: upstream::Post) -> contract::Post {
+fn contract_post(base_url: &str, post: UpstreamPost) -> Post {
     let thread_id = post.thread.unwrap_or(post.id);
     let board = post.board;
     let url = format!(
@@ -55,7 +60,7 @@ fn contract_post(base_url: &str, post: upstream::Post) -> contract::Post {
         thread_id,
         post.id
     );
-    contract::Post {
+    Post {
         board: board.clone(),
         thread_id,
         id: post.id,
@@ -64,7 +69,7 @@ fn contract_post(base_url: &str, post: upstream::Post) -> contract::Post {
         subject: clean(post.subject),
         message: contract_message(post.nomarkup, post.message),
         name: clean(post.name),
-        tripcode: clean(post.tripcode),
+        tripcode: clean(post.public_tripcode),
         capcode: clean(post.capcode),
         donor: post.donor,
         country: country_code(post.country),
@@ -78,12 +83,12 @@ fn contract_post(base_url: &str, post: upstream::Post) -> contract::Post {
 
 #[derive(Debug)]
 pub(crate) struct BuiltEvent {
-    pub(crate) event: contract::WebhookEvent,
+    pub(crate) event: WebhookEvent,
     pub(crate) payload: Vec<u8>,
     pub(crate) poster_identity: Option<String>,
 }
 
-pub(crate) fn encode_event(event: &contract::WebhookEvent) -> Result<Vec<u8>> {
+pub(crate) fn encode_event(event: &WebhookEvent) -> Result<Vec<u8>> {
     let payload = serde_json::to_vec(event).context("encode gateway event")?;
     upstream::assert_contract_safe(&payload)?;
     Ok(payload)
@@ -108,25 +113,21 @@ pub(crate) fn poster_fingerprint(
     )))
 }
 
-fn post_refs(values: Vec<Value>, board: &str, thread_id: i64) -> Vec<contract::PostRef> {
+fn post_refs(values: Vec<Value>, board: &str, thread_id: i64) -> Vec<PostRef> {
     values
         .into_iter()
         .filter_map(|value| post_ref(value, board, thread_id))
         .collect()
 }
 
-fn post_ref(
-    value: Value,
-    fallback_board: &str,
-    fallback_thread_id: i64,
-) -> Option<contract::PostRef> {
+fn post_ref(value: Value, fallback_board: &str, fallback_thread_id: i64) -> Option<PostRef> {
     match value {
-        Value::Number(number) => number.as_i64().map(|post_id| contract::PostRef {
+        Value::Number(number) => number.as_i64().map(|post_id| PostRef {
             board: fallback_board.to_string(),
             thread_id: fallback_thread_id,
             id: post_id,
         }),
-        Value::String(text) => text.parse::<i64>().ok().map(|post_id| contract::PostRef {
+        Value::String(text) => text.parse::<i64>().ok().map(|post_id| PostRef {
             board: fallback_board.to_string(),
             thread_id: fallback_thread_id,
             id: post_id,
@@ -146,7 +147,7 @@ fn post_ref(
                 .or_else(|| map.get("thread_id"))
                 .and_then(Value::as_i64)
                 .unwrap_or(fallback_thread_id);
-            Some(contract::PostRef {
+            Some(PostRef {
                 board,
                 thread_id,
                 id: post_id,
@@ -173,14 +174,13 @@ fn contract_message(nomarkup: Option<String>, message: Option<String>) -> Option
     clean(nomarkup).or_else(|| clean(message))
 }
 
-fn country_code(country: Option<upstream::Country>) -> Option<String> {
+fn country_code(country: Option<Country>) -> Option<String> {
     country.and_then(|country| clean(country.code))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::EventKind;
     use serde_json::json;
 
     #[test]
@@ -337,31 +337,22 @@ mod tests {
     }
 
     #[test]
-    fn accepts_posts_without_country() {
-        let payload = json!({
-            "date": "2026-07-19T12:00:00.000Z",
-            "board": "pn",
-            "thread": 100,
-            "postId": 101,
-            "message": "reply"
-        });
-        let post = contract_post_from_value("https://ptchan.test", payload).unwrap();
+    fn accepts_missing_or_null_country() {
+        for country in [None, Some(Value::Null)] {
+            let mut payload = json!({
+                "date": "2026-07-19T12:00:00.000Z",
+                "board": "pn",
+                "thread": 100,
+                "postId": 101,
+                "message": "reply"
+            });
+            if let Some(country) = country {
+                payload["country"] = country;
+            }
 
-        assert_eq!(post.country, None);
-    }
+            let post = contract_post_from_value("https://ptchan.test", payload).unwrap();
 
-    #[test]
-    fn accepts_null_country() {
-        let payload = json!({
-            "date": "2026-07-19T12:00:00.000Z",
-            "board": "pn",
-            "thread": 100,
-            "postId": 101,
-            "message": "reply",
-            "country": null
-        });
-        let post = contract_post_from_value("https://ptchan.test", payload).unwrap();
-
-        assert_eq!(post.country, None);
+            assert_eq!(post.country, None);
+        }
     }
 }

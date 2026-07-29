@@ -1,13 +1,11 @@
 [ptchan]
 base_url = "https://ptchan.org"
-user_agent = "ptchan-gateway/0.1.0"
-socket_reconnect_min = "3s"
-socket_reconnect_max = "60s"
 
 [[integration]]
 # Integration names become metric labels, origin names, and env var names.
 # Use ASCII letters, digits, underscores, or hyphens.
 name = "example"
+# Every integration requires PTCHAN_INTEGRATION_EXAMPLE_SECRET.
 # Empty means every board. Otherwise list allowed board names, e.g. ["test"].
 # This applies to reading, webhook delivery, and posting.
 allowed_boards = []
@@ -43,12 +41,10 @@ include_poster_fingerprint = false
 # ptchan allows at most 25 chars after adding any secure tripcode:
 #   display_name + "##" + PTCHAN_INTEGRATION_EXAMPLE_TRIPCODE
 display_name = "gw"
-# If true, set PTCHAN_INTEGRATION_EXAMPLE_TRIPCODE.
-# The gateway always sends secure ## tripcodes; plain # tripcodes are unsupported.
-use_tripcode = true
-# If true, set PTCHAN_INTEGRATION_EXAMPLE_POST_PASSWORD.
-use_post_password = true
-timeout = "15s"
+# Public !! tripcode emitted by ptchan for PTCHAN_INTEGRATION_EXAMPLE_TRIPCODE.
+# Posting integrations must use unique secure tripcodes.
+public_tripcode = "!!X8NXmAS44="
+# Also set PTCHAN_INTEGRATION_EXAMPLE_POST_PASSWORD.
 
 [runtime]
 http_addr = "0.0.0.0:8080"
@@ -68,5 +64,6 @@ level = "info"
 format = "json"
 
 [storage]
+# A non-empty SQLITE_PATH environment variable overrides this value.
 sqlite_path = "data/ptchan-gateway.db"
 event_retention = "14d"

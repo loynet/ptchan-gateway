@@ -19,7 +19,7 @@ pub(crate) struct ThreadReader {
 impl ThreadReader {
     pub(crate) fn new(cfg: &PtchanConfig) -> Result<Self> {
         let client = Client::builder()
-            .user_agent(cfg.user_agent.clone())
+            .user_agent(config::gateway_user_agent())
             .build()
             .context("build thread reading client")?;
         Ok(Self {

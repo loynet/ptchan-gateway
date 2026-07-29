@@ -1,129 +1,31 @@
-# Example Tools
+# Gateway Client
 
-This folder contains development tools for exercising the gateway like a real
-integration.
-
-## Gateway Client
-
-`gateway_client` is a small JSON-first CLI for local experiments against a
-running gateway.
-
-The client reads `.env.dev` automatically. You can also override values in the
-shell:
+`gateway_client` is the single development and production smoke-test tool. Set
+the target integration and gateway:
 
 ```bash
-export PTCHAN_GATEWAY_URL=http://127.0.0.1:8080
+export PTCHAN_GATEWAY_URL=https://gateway.example.com
 export PTCHAN_INTEGRATION_NAME=example
 export PTCHAN_INTEGRATION_SECRET=change-me
 ```
 
-Check the gateway:
+Then use the same executable for health checks, signed reads, signed replies,
+or receiving signed webhooks:
 
 ```bash
 cargo run --example gateway_client -- health
+cargo run --example gateway_client -- read test 397 50
+cargo run --example gateway_client -- post test 397 "hello from the gateway"
+printf 'multi-line reply\n' | cargo run --example gateway_client -- post test 397 --stdin
+cargo run --example gateway_client -- listen 127.0.0.1:8081
 ```
 
-Read sanitized thread state:
+The listener accepts `POST /internal/ptchan/events`, verifies the HMAC
+signature, requires webhook schema version `1`, checks that the event ID header
+matches the body, and logs the accepted post coordinates.
 
-```bash
-cargo run --example gateway_client -- read test 397 --limit 50
-```
+The complete machine-readable API and webhook contract is under
+[`docs/contract`](../docs/contract/README.md).
 
-Post a reply through the public posting form:
-
-```bash
-cargo run --example gateway_client -- post test 397 --message ">>399\nhello from the gateway"
-```
-
-`post` prints the gateway JSON response. If the gateway returns a non-2xx
-status, the JSON is still printed and the command exits non-zero, which makes
-shell loops with `|| break` behave as expected.
-
-For multi-line replies:
-
-```bash
-cargo run --example gateway_client -- post test 397 --stdin < reply.txt
-```
-
-Receive signed webhooks and print each accepted event JSON to stdout:
-
-```bash
-cargo run --example gateway_client -- listen --addr 127.0.0.1:8081
-```
-
-To also fetch and print the current sanitized thread after every webhook:
-
-```bash
-cargo run --example gateway_client -- listen --read-after-receive --limit 80
-```
-
-The listener verifies webhook signatures and excludes cookies, authorization,
-and signatures from optional header summaries.
-
-## Webhook Integration
-
-`webhook_integration` is a minimal integration server that receives gateway
-webhooks and logs a compact summary.
-
-Run it with the same integration secret configured for the gateway:
-
-```bash
-PTCHAN_INTEGRATION_SECRET=change-me cargo run --example webhook_integration
-```
-
-The integration listens on `127.0.0.1:8081` by default and accepts events at:
-
-```text
-POST /internal/ptchan/events
-```
-
-It verifies:
-
-- `x-ptchan-event-id`
-- `x-ptchan-timestamp`
-- `x-ptchan-signature`
-
-The signature is HMAC-SHA256 over:
-
-```text
-<timestamp>.<json body>
-```
-
-Use `INTEGRATION_ADDR` to bind a different address.
-
-For more visibility while testing locally:
-
-```bash
-RUST_LOG=webhook_integration=debug,tower_http=warn PTCHAN_INTEGRATION_SECRET=change-me cargo run --example webhook_integration
-```
-
-The integration logs safe header names, body size, parsed event IDs, board/post
-IDs, attachment counts, message size, donor status, and whether a poster
-fingerprint was present. It excludes cookies, authorization, and the webhook
-signature from header summaries.
-
-To inspect the received JSON body during local development only:
-
-```bash
-INTEGRATION_LOG_BODY=1 RUST_LOG=webhook_integration=debug PTCHAN_INTEGRATION_SECRET=change-me cargo run --example webhook_integration
-```
-
-This should stay off outside local testing. The body has already been sanitized
-by the gateway, but it can still contain public post text and optional
-integration-scoped fingerprints.
-
-To also fetch sanitized thread state from the gateway after each accepted event,
-provide the gateway URL:
-
-```bash
-PTCHAN_GATEWAY_URL=http://127.0.0.1:8080 PTCHAN_INTEGRATION_NAME=example PTCHAN_INTEGRATION_SECRET=change-me cargo run --example webhook_integration
-```
-
-Set `PTCHAN_READING_LIMIT` to change the requested thread post limit. It
-defaults to `50`.
-
-For the default `config/dev.toml`, set the gateway secret to the same value:
-
-```bash
-PTCHAN_INTEGRATION_EXAMPLE_SECRET=change-me
-```
+When `PTCHAN_INTEGRATION_SECRET` is absent, the client also checks
+`PTCHAN_INTEGRATION_<INTEGRATION_NAME>_SECRET`.

@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReplyResponse",
+  "description": "Coordinates returned after ptchan accepts and identifies a reply.",
+  "type": "object",
+  "properties": {
+    "board": {
+      "description": "ptchan board name.",
+      "type": "string"
+    },
+    "origin": {
+      "description": "Integration that submitted the reply.",
+      "$ref": "#/$defs/PostOrigin"
+    },
+    "post_id": {
+      "description": "Created post ID.",
+      "type": "integer",
+      "format": "int64"
+    },
+    "thread_id": {
+      "description": "Containing thread post ID.",
+      "type": "integer",
+      "format": "int64"
+    },
+    "url": {
+      "description": "Canonical public post URL.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "board",
+    "thread_id",
+    "post_id",
+    "url",
+    "origin"
+  ],
+  "$defs": {
+    "OriginKind": {
+      "description": "Supported producer categories.",
+      "oneOf": [
+        {
+          "description": "A configured gateway integration.",
+          "type": "string",
+          "const": "integration"
+        }
+      ]
+    },
+    "PostOrigin": {
+      "description": "Gateway-known producer of a post.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "Producer category.",
+          "$ref": "#/$defs/OriginKind"
+        },
+        "name": {
+          "description": "Configured integration name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "name"
+      ]
+    }
+  }
+}

@@ -2,12 +2,15 @@ use std::{error::Error, fmt};
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::config::{self, PostingConfig, PtchanConfig};
+use crate::{
+    config::{self, PostingConfig, PtchanConfig},
+    contract::{ErrorCode, OriginKind, PostOrigin, ReplyRequest, ReplyResponse},
+};
 
 pub(crate) const MAX_REPLY_MESSAGE_BYTES: usize = 8_000;
+const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Clone)]
 pub(crate) struct PostWriter {
@@ -15,28 +18,10 @@ pub(crate) struct PostWriter {
     client: Client,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReplyRequest {
-    pub(crate) message: String,
-    #[serde(default)]
-    pub(crate) sage: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ReplyResponse {
-    pub(crate) board: String,
-    pub(crate) thread_id: i64,
-    #[serde(rename = "post_id")]
-    pub(crate) post_id: i64,
-    pub(crate) url: String,
-    pub(crate) origin: crate::contract::PostOrigin,
-}
-
 impl PostWriter {
     pub(crate) fn new(cfg: &PtchanConfig) -> Result<Self> {
         let client = Client::builder()
-            .user_agent(cfg.user_agent.clone())
+            .user_agent(config::gateway_user_agent())
             .build()
             .context("build posting client")?;
         Ok(Self {
@@ -52,33 +37,26 @@ impl PostWriter {
         thread_id: i64,
         request: &ReplyRequest,
     ) -> std::result::Result<ReplyResponse, ReplyError> {
-        validate_reply(board, thread_id, &request.message).map_err(ReplyError::InvalidRequest)?;
-        let url = posting_url(&self.base_url, board);
-        let referer = thread_url(&self.base_url, board, thread_id);
-        let form = reply_form(posting, thread_id, request);
-
         let response = self
-            .client
-            .post(url)
-            .timeout(posting.timeout)
-            .header("accept", "application/json")
-            .header("referer", referer)
-            .header("x-using-xhr", "true")
-            .form(&form)
+            .reply_request(posting, board, thread_id, request)
             .send()
             .await
-            .map_err(|err| ReplyError::Request(anyhow!(err).context("send ptchan reply")))?;
+            .map_err(|err| ReplyError::StateUnknown {
+                source: anyhow!(err).context("send ptchan reply"),
+                accepted: false,
+            })?;
         let status = response.status();
         let body = match response.text().await {
             Ok(body) => body,
             Err(err) if status.is_success() => {
-                return Err(ReplyError::Request(
-                    anyhow!(err).context("read ptchan reply response"),
-                ));
+                return Err(ReplyError::StateUnknown {
+                    source: anyhow!(err).context("read ptchan reply response"),
+                    accepted: true,
+                });
             }
-            Err(err) => {
+            Err(_) => {
                 return Err(ReplyError::Upstream(
-                    UpstreamReplyError::from_body_read_error(status, &err),
+                    UpstreamReplyError::from_unreadable_response(status),
                 ));
             }
         };
@@ -88,10 +66,14 @@ impl PostWriter {
             )));
         }
         let created = serde_json::from_str::<UpstreamReply>(&body).map_err(|err| {
-            ReplyError::AcceptedUnknown(anyhow!(err).context("decode ptchan reply response"))
+            ReplyError::StateUnknown {
+                source: anyhow!(err).context("decode ptchan reply response"),
+                accepted: true,
+            }
         })?;
-        let post_id = created.post_id.ok_or_else(|| {
-            ReplyError::AcceptedUnknown(anyhow!("ptchan reply response did not include postId"))
+        let post_id = created.post_id.ok_or_else(|| ReplyError::StateUnknown {
+            source: anyhow!("ptchan reply response did not include postId"),
+            accepted: true,
         })?;
         Ok(ReplyResponse {
             board: board.to_string(),
@@ -102,28 +84,44 @@ impl PostWriter {
                 thread_url(&self.base_url, board, thread_id),
                 post_id
             ),
-            origin: crate::contract::PostOrigin {
-                kind: crate::contract::OriginKind::Integration,
+            origin: PostOrigin {
+                kind: OriginKind::Integration,
                 name: posting.name.clone(),
             },
         })
+    }
+
+    fn reply_request(
+        &self,
+        posting: &PostingConfig,
+        board: &str,
+        thread_id: i64,
+        request: &ReplyRequest,
+    ) -> reqwest::RequestBuilder {
+        self.client
+            .post(posting_url(&self.base_url, board))
+            .timeout(REPLY_TIMEOUT)
+            .header("accept", "application/json")
+            .header("referer", thread_url(&self.base_url, board, thread_id))
+            .header("x-using-xhr", "true")
+            .form(&reply_form(posting, thread_id, request))
     }
 }
 
 #[derive(Debug)]
 pub(crate) enum ReplyError {
-    InvalidRequest(ReplyValidationError),
     Upstream(UpstreamReplyError),
-    AcceptedUnknown(anyhow::Error),
-    Request(anyhow::Error),
+    StateUnknown {
+        source: anyhow::Error,
+        accepted: bool,
+    },
 }
 
 impl fmt::Display for ReplyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidRequest(err) => write!(f, "{err}"),
             Self::Upstream(err) => write!(f, "{err}"),
-            Self::AcceptedUnknown(err) | Self::Request(err) => write!(f, "{err}"),
+            Self::StateUnknown { source, .. } => write!(f, "{source}"),
         }
     }
 }
@@ -140,13 +138,13 @@ pub(crate) enum ReplyValidationError {
 }
 
 impl ReplyValidationError {
-    pub(crate) const fn code(self) -> &'static str {
+    pub(crate) const fn code(self) -> ErrorCode {
         match self {
-            Self::InvalidBoard => "invalid_board",
-            Self::InvalidThreadId => "invalid_thread_id",
-            Self::MissingMessage => "missing_message",
-            Self::MessageTooLong => "message_too_long",
-            Self::InvalidMessage => "invalid_message",
+            Self::InvalidBoard => ErrorCode::InvalidBoard,
+            Self::InvalidThreadId => ErrorCode::InvalidThreadId,
+            Self::MissingMessage => ErrorCode::MissingMessage,
+            Self::MessageTooLong => ErrorCode::MessageTooLong,
+            Self::InvalidMessage => ErrorCode::InvalidMessage,
         }
     }
 }
@@ -164,77 +162,44 @@ impl fmt::Display for ReplyValidationError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum UpstreamReplyErrorCode {
-    CaptchaRequired,
-    BlockBypassRequired,
-    RateLimited,
-    ThreadNotFound,
-    ThreadLocked,
-    ThreadReplyLimit,
-    BoardLocked,
-    Rejected,
-}
-
-impl UpstreamReplyErrorCode {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::CaptchaRequired => "captcha_required",
-            Self::BlockBypassRequired => "block_bypass_required",
-            Self::RateLimited => "rate_limited",
-            Self::ThreadNotFound => "thread_not_found",
-            Self::ThreadLocked => "thread_locked",
-            Self::ThreadReplyLimit => "thread_reply_limit",
-            Self::BoardLocked => "board_locked",
-            Self::Rejected => "rejected",
-        }
-    }
-
-    pub(crate) const fn retryable(self) -> bool {
-        matches!(self, Self::RateLimited)
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct UpstreamReplyError {
     pub(crate) status: StatusCode,
-    pub(crate) code: UpstreamReplyErrorCode,
-    pub(crate) message: String,
+    pub(crate) code: ErrorCode,
 }
 
 impl UpstreamReplyError {
     fn from_response(status: StatusCode, body: &str) -> Self {
-        let message = upstream_error_message(body)
-            .unwrap_or_else(|| format!("ptchan rejected the reply with status {status}"));
-        let code = classify_upstream_error(status, &message, body);
         Self {
             status,
-            code,
-            message,
+            code: classify_upstream_error(status, body),
         }
     }
 
-    fn from_body_read_error(status: StatusCode, err: &reqwest::Error) -> Self {
-        let message = format!(
-            "ptchan rejected the reply with status {status}; response body could not be read"
-        );
-        let code = classify_upstream_error(status, &message, &err.to_string());
+    fn from_unreadable_response(status: StatusCode) -> Self {
         Self {
             status,
-            code,
-            message,
+            code: classify_upstream_error(status, ""),
+        }
+    }
+
+    pub(crate) const fn public_message(&self) -> &'static str {
+        match self.code {
+            ErrorCode::CaptchaRequired => "ptchan requires captcha verification",
+            ErrorCode::BlockBypassRequired => "ptchan requires a block bypass",
+            ErrorCode::RateLimited => "ptchan rate limit exceeded",
+            ErrorCode::ThreadNotFound => "thread was not found",
+            ErrorCode::ThreadLocked => "thread is locked",
+            ErrorCode::ThreadReplyLimit => "thread reply limit reached",
+            ErrorCode::BoardLocked => "board is locked",
+            _ => "ptchan rejected the reply",
         }
     }
 }
 
 impl fmt::Display for UpstreamReplyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "ptchan reply rejected: {} ({})",
-            self.message, self.status
-        )
+        write!(f, "ptchan reply rejected: {} ({})", self.code, self.status)
     }
 }
 
@@ -294,81 +259,38 @@ fn reply_form(
     if request.sage {
         form.push(("email".to_string(), "sage".to_string()));
     }
-    if let Some(name) = posting_name(posting) {
-        form.push(("name".to_string(), name));
-    }
-    if let Some(password) = posting.post_password.as_deref() {
-        form.push(("postpassword".to_string(), password.to_string()));
-    }
+    form.push(("name".to_string(), posting.form_name()));
+    form.push(("postpassword".to_string(), posting.post_password.clone()));
     form
 }
 
-fn upstream_error_message(body: &str) -> Option<String> {
-    let value = serde_json::from_str::<Value>(body).ok()?;
-    if let Some(message) = value.get("message").and_then(Value::as_str) {
-        let message = message.trim();
-        if !message.is_empty() {
-            return Some(message.to_string());
-        }
-    }
-    if let Some(errors) = value.get("errors").and_then(Value::as_array) {
-        let messages = errors
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|message| !message.is_empty())
-            .collect::<Vec<_>>();
-        if !messages.is_empty() {
-            return Some(messages.join("; "));
-        }
-    }
-    None
-}
-
-fn classify_upstream_error(
-    status: StatusCode,
-    message: &str,
-    body: &str,
-) -> UpstreamReplyErrorCode {
-    let haystack = format!("{message}\n{body}").to_ascii_lowercase();
+fn classify_upstream_error(status: StatusCode, body: &str) -> ErrorCode {
+    let haystack = body.to_ascii_lowercase();
     if haystack.contains("captcha") {
-        return UpstreamReplyErrorCode::CaptchaRequired;
+        return ErrorCode::CaptchaRequired;
     }
     if haystack.contains("block bypass") || haystack.contains("bypass_minimal") {
-        return UpstreamReplyErrorCode::BlockBypassRequired;
+        return ErrorCode::BlockBypassRequired;
     }
     if status == StatusCode::TOO_MANY_REQUESTS
         || haystack.contains("flood")
         || haystack.contains("wait before")
     {
-        return UpstreamReplyErrorCode::RateLimited;
+        return ErrorCode::RateLimited;
     }
     if haystack.contains("thread does not exist") {
-        return UpstreamReplyErrorCode::ThreadNotFound;
+        return ErrorCode::ThreadNotFound;
     }
     if haystack.contains("thread locked") {
-        return UpstreamReplyErrorCode::ThreadLocked;
+        return ErrorCode::ThreadLocked;
     }
     if haystack.contains("reply limit") {
-        return UpstreamReplyErrorCode::ThreadReplyLimit;
+        return ErrorCode::ThreadReplyLimit;
     }
     if haystack.contains("board locked") || haystack.contains("thread creation locked") {
-        return UpstreamReplyErrorCode::BoardLocked;
+        return ErrorCode::BoardLocked;
     }
-    UpstreamReplyErrorCode::Rejected
-}
-
-fn posting_name(posting: &PostingConfig) -> Option<String> {
-    let name = posting
-        .display_name
-        .as_deref()
-        .unwrap_or(&posting.name)
-        .trim();
-    match posting.tripcode.as_deref() {
-        Some(tripcode) => Some(format!("{name}##{tripcode}")),
-        None if name.is_empty() => None,
-        None => Some(name.to_string()),
-    }
+    ErrorCode::Rejected
 }
 
 #[derive(Deserialize)]
@@ -380,7 +302,6 @@ struct UpstreamReply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn validates_reply_shape() {
@@ -405,96 +326,106 @@ mod tests {
     }
 
     #[test]
-    fn keeps_producer_message_as_single_form_value() {
-        let posting = PostingConfig {
-            name: "agent".to_string(),
-            allowed_boards: vec!["i".to_string()],
-            display_name: Some("Agent".to_string()),
-            secret: "integration-secret".to_string(),
-            tripcode: Some("trip-secret".to_string()),
-            post_password: Some("post-secret".to_string()),
-            timeout: Duration::from_secs(15),
-        };
+    fn builds_only_the_public_reply_request() {
+        let writer = PostWriter::new(&PtchanConfig {
+            base_url: "https://ptchan.test".to_string(),
+        })
+        .unwrap();
         let request = ReplyRequest {
             message: "hello&thread=999&name=staff\r\npostpassword=hijack".to_string(),
             sage: true,
         };
 
-        let form = reply_form(&posting, 100, &request);
+        let request = writer
+            .reply_request(&posting(), "i", 100, &request)
+            .build()
+            .unwrap();
 
         assert_eq!(
-            form,
-            vec![
-                ("thread".to_string(), "100".to_string()),
-                (
-                    "message".to_string(),
-                    "hello&thread=999&name=staff\r\npostpassword=hijack".to_string()
-                ),
-                ("email".to_string(), "sage".to_string()),
-                ("name".to_string(), "Agent##trip-secret".to_string()),
-                ("postpassword".to_string(), "post-secret".to_string()),
-            ]
+            request.url().as_str(),
+            "https://ptchan.test/forms/board/i/post"
+        );
+        assert_eq!(
+            request.headers().get("referer").unwrap(),
+            "https://ptchan.test/i/thread/100.html"
+        );
+        assert!(request.headers().get("cookie").is_none());
+        assert_eq!(
+            request.body().unwrap().as_bytes().unwrap(),
+            b"thread=100&message=hello%26thread%3D999%26name%3Dstaff%0D%0Apostpassword%3Dhijack&email=sage&name=Agent%23%23trip-secret&postpassword=post-secret"
         );
     }
 
     #[test]
-    fn builds_public_posting_and_thread_urls() {
-        assert_eq!(
-            posting_url("https://ptchan.org/", "test"),
-            "https://ptchan.org/forms/board/test/post"
+    fn classifies_known_jschan_rejections() {
+        let cases = [
+            (
+                StatusCode::FORBIDDEN,
+                r#"{"message":"Captcha failed"}"#,
+                ErrorCode::CaptchaRequired,
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                r#"{"message":"Please complete a block bypass"}"#,
+                ErrorCode::BlockBypassRequired,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"message":"Flood detected"}"#,
+                ErrorCode::RateLimited,
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                r#"{"message":"Thread does not exist"}"#,
+                ErrorCode::ThreadNotFound,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"errors":["Thread locked","Message is too long"]}"#,
+                ErrorCode::ThreadLocked,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"message":"Thread reply limit reached"}"#,
+                ErrorCode::ThreadReplyLimit,
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                r#"{"message":"Board locked"}"#,
+                ErrorCode::BoardLocked,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"message":"Unknown rejection"}"#,
+                ErrorCode::Rejected,
+            ),
+        ];
+
+        for (status, body, expected) in cases {
+            let err = UpstreamReplyError::from_response(status, body);
+
+            assert_eq!(err.code, expected, "{body}");
+            assert_eq!(err.code.retryable(), expected == ErrorCode::RateLimited);
+            assert!(!err.public_message().contains("Unknown rejection"));
+        }
+
+        let rejected = UpstreamReplyError::from_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"message":"private upstream detail"}"#,
         );
-        assert_eq!(
-            thread_url("https://ptchan.org/", "test", 397),
-            "https://ptchan.org/test/thread/397.html"
-        );
+        assert_eq!(rejected.public_message(), "ptchan rejected the reply");
+        assert!(!rejected.to_string().contains("private upstream detail"));
     }
 
-    #[test]
-    fn builds_name_with_configured_tripcode_secret() {
-        let posting = PostingConfig {
+    fn posting() -> PostingConfig {
+        PostingConfig {
             name: "agent".to_string(),
             allowed_boards: vec!["i".to_string()],
             display_name: Some("Agent".to_string()),
             secret: "integration-secret".to_string(),
-            tripcode: Some("trip-secret".to_string()),
-            post_password: None,
-            timeout: Duration::from_secs(15),
-        };
-
-        assert_eq!(
-            posting_name(&posting).as_deref(),
-            Some("Agent##trip-secret")
-        );
-    }
-
-    #[test]
-    fn extracts_jschan_error_messages() {
-        let body =
-            r#"{"title":"Forbidden","message":"Please complete a block bypass to continue"}"#;
-        let err = UpstreamReplyError::from_response(StatusCode::FORBIDDEN, body);
-
-        assert_eq!(err.code, UpstreamReplyErrorCode::BlockBypassRequired);
-        assert_eq!(err.message, "Please complete a block bypass to continue");
-    }
-
-    #[test]
-    fn classifies_captcha_errors_from_jschan_body() {
-        let body = r#"{"title":"Forbidden","message":"Captcha failed"}"#;
-        let err = UpstreamReplyError::from_response(StatusCode::FORBIDDEN, body);
-
-        assert_eq!(err.code, UpstreamReplyErrorCode::CaptchaRequired);
-        assert!(!err.code.retryable());
-    }
-
-    #[test]
-    fn joins_jschan_validation_errors() {
-        let body = r#"{"title":"Bad request","errors":["Thread locked","Message must be 10 characters or less"]}"#;
-        let err = UpstreamReplyError::from_response(StatusCode::BAD_REQUEST, body);
-
-        assert_eq!(err.code, UpstreamReplyErrorCode::ThreadLocked);
-        assert_eq!(
-            err.message,
-            "Thread locked; Message must be 10 characters or less"
-        );
+            tripcode_secret: "trip-secret".to_string(),
+            public_tripcode: "!!X8NXmAS44=".to_string(),
+            post_password: "post-secret".to_string(),
+        }
     }
 }

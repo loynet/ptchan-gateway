@@ -75,8 +75,22 @@ PTCHAN_INTEGRATION_<INTEGRATION_NAME>_TRIPCODE
 PTCHAN_INTEGRATION_<INTEGRATION_NAME>_POST_PASSWORD
 ```
 
-Only require those posting secrets when the corresponding config flags are
-enabled. Keep TOML for non-secret structure.
+Every posting integration requires its secure tripcode secret. Its
+`posting.public_tripcode` TOML value is the corresponding public `!!` tripcode
+emitted by ptchan and must be unique. Every posting integration also requires a
+post password for ptchan's public post-management features. Keep TOML for
+non-secret structure.
+
+Configuration has two deliberate representations:
+
+- private file types describe untrusted TOML and optional capability sections;
+- runtime types contain validated settings, resolved secrets, and only enabled
+  capabilities.
+
+Keep that transition one-way. Do not deserialize directly into runtime types,
+store empty secret sentinels, mutate parsed configuration into readiness, or
+make callers repeatedly interpret optional TOML sections. Validate structure
+before resolving secrets, then construct runtime configuration once.
 
 ## Runtime API
 
@@ -85,6 +99,7 @@ The runtime HTTP server exposes:
 - `GET /healthz`
 - `GET /readyz`
 - `GET /metrics`
+- `GET /integration/v1/openapi.json`
 - `GET /integration/v1/threads/:board/:thread_id?limit=50`
 - `POST /integration/v1/threads/:board/:thread_id/replies`
 
@@ -108,6 +123,12 @@ Posting signatures cover:
 <timestamp>.<method>.<path-and-query>.<json body>
 ```
 
+Signed integration attempts consume quota immediately after authentication and
+capability/board authorization, before query, path, JSON, or message
+validation. Keep reading and posting consistent. Oversized bodies are rejected
+before complete-body signature verification and therefore cannot consume
+authenticated quota.
+
 Webhook deliveries use:
 
 ```http
@@ -124,7 +145,24 @@ Webhook signatures cover:
 
 ## Contract
 
-V1 emits only `thread.created` and `post.created`.
+V1 emits only `thread.created` and `post.created`. Every webhook carries
+`"schema_version": "1"`.
+
+All integration-facing DTOs and stable error codes belong in `src/contract.rs`.
+Every integration API failure must use the contract-owned JSON error envelope;
+do not fall back to empty or plain-text Axum rejections.
+
+OpenAPI, standalone JSON Schemas, and canonical examples live under
+`docs/contract/` and are generated from the Rust wire types. After an
+intentional contract change, run:
+
+```bash
+cargo run -- --write-contract
+```
+
+Do not edit generated JSON by hand. `make` checks that committed artifacts are
+current. Preserve V1 fields and meanings; additions must be optional, and
+consumers are expected to ignore unknown response fields.
 
 Event IDs are:
 
@@ -161,6 +199,8 @@ identity fields.
 
 Webhook delivery is durable and at-least-once, but ordering is best-effort.
 Retries can cause later events to reach an integration before earlier events.
+Delivery attempts are bounded but concurrent so one slow webhook does not
+block unrelated integrations.
 
 Integrations must use `x-ptchan-event-id` / `event_id` for idempotency and
 tolerate duplicates, delayed delivery, and out-of-order delivery. Do not
@@ -172,14 +212,15 @@ delivered, retention removes old events after `storage.event_retention`.
 Cleanup runs on startup and then hourly. Pending deliveries must not be purged
 by retention.
 
-Produced-post origin tracking uses `produced_posts` and
-`pending_produced_posts`. Keep it best-effort but avoid reporting a successful
-reply before the gateway has recorded enough state to recognize its own post.
-Document missing `origin` as "not known to be produced by this gateway", not as
-proof that some other actor created the post. Best-effort matching can fail when
-ptchan accepts a reply but the gateway cannot decode the post id, the later
-socket event has no comparable message text, the pending row expired, storage
-failed, or identical pending replies make the match ambiguous.
+Produced-post origin tracking is deterministic and stateless. Posting
+integrations always submit a secure `##` tripcode, and webhook/thread posts are
+attributed by exact match against the configured public `!!` tripcode. Do not
+store post coordinates or message digests for origin tracking.
+
+Preserve that identity on every integration-facing read and webhook payload:
+`post.tripcode` is ptchan's public `!!` value and matching posts also receive
+the integration `origin`. The private tripcode secret is used only to construct
+the upstream posting form and must never enter the integration contract.
 
 ## Posting Rules
 
@@ -202,7 +243,7 @@ Metrics should answer operational questions without leaking sensitive data:
 
 - upstream auth/socket health;
 - event intake and redaction drops;
-- webhook backlog, delivery outcomes, and delivery latency;
+- webhook backlog, oldest pending age, delivery outcomes, and delivery latency;
 - integration read/post outcomes and latency by configured integration, board,
   and result;
 - storage errors;
@@ -230,8 +271,8 @@ make tools  # install cargo-machete and cargo-deny
 ```
 
 `make` runs formatting checks, strict Clippy including `pedantic`, tests,
-config validation, `cargo machete`, `cargo deny`, and a release build. Keep it
-green before handing work back.
+generated-contract validation, config validation, `cargo machete`,
+`cargo deny`, and a release build. Keep it green before handing work back.
 
 If dependency tools are missing, install them with `make tools`. Do not weaken
 checks to make the target pass.
@@ -244,15 +285,23 @@ generic machinery. Use idiomatic Rust naming and API shapes: predictable
 methods, standard conversion traits where they help, common derived traits where
 they are useful, and consistent word order for related types.
 
-Follow the patterns already present in the codebase unless there is a clear
-reason to improve them. If an existing pattern feels wrong, too coupled, or too
-heavy for what it does, raise that directly and either fix it within the task or
-leave a clear note for a follow-up.
+Use the extension points provided by the libraries already in the service.
+Axum extractors and responses, Reqwest request/response APIs, Serde models,
+Tokio task and blocking boundaries, and protocol-focused crates should own
+their standard concerns. Add custom machinery only for gateway domain policy or
+when the library abstraction cannot preserve a documented requirement.
+
+Keep control flow visible. Avoid pass-through methods, functions that merely
+rename another call, duplicate derived state, and layers that require jumping
+between files without adding a boundary. Put concrete domain behavior on the
+type that owns the data when that makes the call site self-explanatory.
 
 The right abstraction here earns its keep. Add one when it removes real
 duplication, makes a privacy/security boundary harder to misuse, or lets risky
 behavior be tested directly. Do not add helper functions, traits, builders, or
-configuration layers just to make code look more abstract.
+configuration layers just to make code look more abstract. Judge an abstraction
+by whether it reduces total reasoning across definitions, callers, and tests,
+not by whether it shortens one file.
 
 Prefer clear ownership and concrete types. Avoid lifetime gymnastics,
 unnecessary generics, trait objects, and shared mutable state unless the code's
@@ -261,8 +310,15 @@ than making ownership hard to read.
 
 Use types to protect important states and boundaries, especially privacy,
 authorization, signatures, posting outcomes, and upstream/gateway contract
-separation. Do not create wrapper types that only rename a single value without
-reducing risk or complexity.
+separation. Parsed input and valid runtime state should be different types when
+that prevents partial initialization or repeated checks. Do not create wrapper
+types that only rename a single value without reducing risk or complexity.
+
+Split modules around responsibilities that can be understood and tested alone.
+Do not split files or crates merely to hide line count, and do not introduce a
+workspace until components have genuinely separate dependency, release, or
+reuse boundaries. Use domain knowledge to delete state and reconciliation
+machinery when a stable upstream fact can make the result deterministic.
 
 Be dependency-conscious. Use the standard library and existing dependencies
 first. Add a crate when it avoids meaningful protocol/security risk or replaces
@@ -303,9 +359,11 @@ When you notice a better structure, call it out. If it is directly connected to
 the task and lowers risk or complexity, make the change. If it is broader, leave
 a clear note rather than quietly expanding scope.
 
-## Known Exception
+## Socket Client Choice
 
-`rust_socketio 0.6.0` currently pulls unmaintained `backoff` and `instant`
-transitively. The exception is recorded in `deny.toml`; revisit it before
-production hardening by testing a maintained Socket.IO client or isolating the
-protocol dependency.
+The gateway currently uses `tokio-tungstenite` plus the small protocol decoder
+in `src/socket/protocol.rs`. The available `rust_socketio` async API is
+callback-oriented and documented as beta, and it does not improve the explicit
+management-cookie, room-join readiness, and cooperative-shutdown behavior this
+service needs. Revisit the choice when a maintained client can preserve those
+requirements with less code.

@@ -1,166 +1,89 @@
 use std::{
     cmp,
-    sync::{Arc, RwLock},
+    sync::{Arc, PoisonError, RwLock},
     time::Duration,
 };
 
-use anyhow::Context;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use reqwest::Client;
+use cookie_store::{CookieExpiration, CookieStore, RawCookie};
+use reqwest::{header::HeaderValue, Client, Url};
 use serde_json::Value;
 use tokio::{sync::watch, time};
 use tracing::{debug, info, warn};
 
-use crate::{config::PtchanConfig, metrics, runtime::Status};
+use crate::{
+    config::{self, PtchanConfig},
+    metrics,
+    runtime::Status,
+};
 
 const SESSION_REFRESH_RETRY_INTERVAL: Duration = Duration::from_mins(1);
 const SESSION_REFRESH_MAX_SAFETY_MARGIN: Duration = Duration::from_hours(1);
 
 pub(crate) struct SessionCookie {
-    cookies: RwLock<Vec<StoredCookie>>,
-}
-
-#[derive(Clone)]
-struct StoredCookie {
-    name: String,
-    pair: String,
-    expires_at: Option<DateTime<Utc>>,
+    store: RwLock<CookieStore>,
+    url: Url,
 }
 
 impl SessionCookie {
-    pub(crate) fn new(value: &str) -> Self {
-        let parsed = parse_cookie_header(value, Utc::now());
-        Self {
-            cookies: RwLock::new(
-                parsed
-                    .pairs
-                    .into_iter()
-                    .map(|pair| StoredCookie {
-                        name: pair.name,
-                        pair: pair.value,
-                        expires_at: parsed.expires_at,
-                    })
-                    .collect(),
-            ),
+    pub(crate) fn new(value: &str, base_url: &str) -> Result<Self> {
+        let url = Url::parse(base_url).context("parse ptchan base url for cookie store")?;
+        let mut store = CookieStore::new();
+        for cookie in RawCookie::split_parse(value) {
+            let cookie = cookie.context("parse management Cookie header")?;
+            store
+                .insert_raw(&cookie, &url)
+                .context("store management cookie")?;
         }
+        if store.get_request_values(&url).next().is_none() {
+            anyhow::bail!("management Cookie header did not contain any cookies");
+        }
+        Ok(Self {
+            store: RwLock::new(store),
+            url,
+        })
     }
 
     pub(crate) fn get(&self) -> String {
-        self.cookies
+        self.store
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .map(|cookie| cookie.pair.as_str())
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_request_values(&self.url)
+            .map(|(name, value)| format!("{name}={value}"))
             .collect::<Vec<_>>()
             .join("; ")
     }
 
     fn expires_at(&self) -> Option<DateTime<Utc>> {
-        self.cookies
+        self.store
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter_map(|cookie| cookie.expires_at)
+            .unwrap_or_else(PoisonError::into_inner)
+            .matches(&self.url)
+            .into_iter()
+            .filter_map(|cookie| match cookie.expires {
+                CookieExpiration::AtUtc(expires_at) => {
+                    DateTime::from_timestamp(expires_at.unix_timestamp(), 0)
+                }
+                CookieExpiration::SessionEnd => None,
+            })
             .min()
     }
 
-    fn merge(&self, updates: Vec<ParsedCookieHeader>, now: DateTime<Utc>) -> bool {
-        let mut cookies = self
-            .cookies
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut changed = false;
-        for update in updates {
-            for pair in update.pairs {
-                let position = cookies
-                    .iter()
-                    .position(|cookie| cookie.name.eq_ignore_ascii_case(&pair.name));
-                if update
-                    .expires_at
-                    .is_some_and(|expires_at| expires_at <= now)
-                {
-                    if let Some(position) = position {
-                        cookies.remove(position);
-                        changed = true;
-                    }
-                    continue;
-                }
-                let cookie = StoredCookie {
-                    name: pair.name,
-                    pair: pair.value,
-                    expires_at: update.expires_at,
-                };
-                if let Some(position) = position {
-                    if cookies[position].pair != cookie.pair
-                        || cookies[position].expires_at != cookie.expires_at
-                    {
-                        cookies[position] = cookie;
-                        changed = true;
-                    }
-                } else {
-                    cookies.push(cookie);
-                    changed = true;
-                }
-            }
+    fn merge(&self, updates: &[HeaderValue]) -> Result<bool> {
+        let mut store = self.store.write().unwrap_or_else(PoisonError::into_inner);
+        for value in updates {
+            store
+                .parse(
+                    value
+                        .to_str()
+                        .context("ptchan Set-Cookie header was not text")?,
+                    &self.url,
+                )
+                .context("parse ptchan Set-Cookie header")?;
         }
-        changed
+        Ok(!updates.is_empty())
     }
-}
-
-struct ParsedCookieHeader {
-    value: String,
-    pairs: Vec<ParsedCookie>,
-    expires_at: Option<DateTime<Utc>>,
-}
-
-struct ParsedCookie {
-    name: String,
-    value: String,
-}
-
-fn parse_cookie_header(value: &str, now: DateTime<Utc>) -> ParsedCookieHeader {
-    let mut pairs = Vec::new();
-    let mut max_age_expires_at = None;
-    let mut expires_at = None;
-    for part in value
-        .split(';')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        let Some((name, value)) = part.split_once('=') else {
-            continue;
-        };
-        match name.to_ascii_lowercase().as_str() {
-            "domain" | "path" | "priority" | "samesite" => {}
-            "expires" => expires_at = parse_cookie_expires(value),
-            "max-age" => max_age_expires_at = parse_cookie_max_age(value, now),
-            _ => pairs.push(ParsedCookie {
-                name: name.to_string(),
-                value: part.to_string(),
-            }),
-        }
-    }
-    let value = pairs
-        .iter()
-        .map(|pair| pair.value.as_str())
-        .collect::<Vec<_>>()
-        .join("; ");
-    ParsedCookieHeader {
-        value,
-        pairs,
-        expires_at: max_age_expires_at.or(expires_at),
-    }
-}
-
-fn parse_cookie_expires(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc2822(value)
-        .ok()
-        .map(|date| date.with_timezone(&Utc))
-}
-
-fn parse_cookie_max_age(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let seconds = value.parse::<i64>().ok()?;
-    Some(now + chrono::Duration::seconds(seconds))
 }
 
 pub(crate) async fn refresh_loop(
@@ -169,7 +92,10 @@ pub(crate) async fn refresh_loop(
     status: Arc<Status>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let client = match Client::builder().user_agent(cfg.user_agent.clone()).build() {
+    let client = match Client::builder()
+        .user_agent(config::gateway_user_agent())
+        .build()
+    {
         Ok(client) => client,
         Err(err) => {
             status.set_auth_healthy(false);
@@ -252,7 +178,7 @@ async fn refresh_once(
         .headers()
         .get_all("set-cookie")
         .iter()
-        .map(std::borrow::ToOwned::to_owned)
+        .cloned()
         .collect::<Vec<_>>();
     let body = response
         .text()
@@ -262,21 +188,12 @@ async fn refresh_once(
         .context("refresh response was not valid management JSON")?;
     validate_recent_json(&body).context("refresh response was not management recent JSON")?;
 
-    let mut updates = Vec::new();
-    let now = Utc::now();
-    for value in &set_cookies {
-        let value = value.to_str()?;
-        let parsed = parse_cookie_header(value, now);
-        if !parsed.value.is_empty() {
-            updates.push(parsed);
-        }
-    }
-    if !updates.is_empty() {
+    if !set_cookies.is_empty() {
         debug!(
-            set_cookie_count = updates.len(),
+            set_cookie_count = set_cookies.len(),
             "ptchan session cookie update accepted"
         );
-        let cookie_changed = cookie.merge(updates, now);
+        let cookie_changed = cookie.merge(&set_cookies)?;
         ensure_cookie_has_expiry(cookie)?;
         return Ok(cookie_changed);
     }
@@ -318,82 +235,78 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn strips_set_cookie_attributes_and_keeps_expiry() {
-        let now = Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 0).unwrap();
-        let parsed = parse_cookie_header(
-            "session=s%3Aabc; Path=/; Expires=Wed, 22 Jul 2026 16:28:48 GMT; HttpOnly; Secure; SameSite=Lax",
-            now,
-        );
+    fn set_cookie_attributes_are_not_sent_as_cookies() {
+        let cookie = session_cookie("session=old");
+        cookie
+            .merge(&[HeaderValue::from_static(
+                "session=s%3Aabc; Path=/; Expires=Mon, 22 Jul 2030 16:28:48 GMT; HttpOnly; Secure; SameSite=Lax",
+            )])
+            .unwrap();
 
-        assert_eq!(parsed.value, "session=s%3Aabc");
+        assert_eq!(cookie.get(), "session=s%3Aabc");
         assert_eq!(
-            parsed.expires_at,
-            Some(Utc.with_ymd_and_hms(2026, 7, 22, 16, 28, 48).unwrap())
+            cookie.expires_at(),
+            Some(Utc.with_ymd_and_hms(2030, 7, 22, 16, 28, 48).unwrap())
         );
     }
 
     #[test]
-    fn max_age_sets_expiry_relative_to_refresh_time() {
-        let now = Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 0).unwrap();
-        let parsed = parse_cookie_header(
-            "session=s%3Aabc; Expires=Wed, 22 Jul 2026 16:28:48 GMT; Max-Age=120; Path=/",
-            now,
-        );
+    fn max_age_overrides_expires() {
+        let cookie = session_cookie("session=old");
+        let before = Utc::now();
+        cookie
+            .merge(&[HeaderValue::from_static(
+                "session=s%3Aabc; Expires=Mon, 22 Jul 2030 16:28:48 GMT; Max-Age=120; Path=/",
+            )])
+            .unwrap();
+        let after = Utc::now();
+        let expires_at = cookie.expires_at().unwrap();
 
-        assert_eq!(parsed.value, "session=s%3Aabc");
-        assert_eq!(
-            parsed.expires_at,
-            Some(Utc.with_ymd_and_hms(2026, 7, 19, 12, 2, 0).unwrap())
-        );
+        assert!(expires_at >= before + chrono::Duration::seconds(119));
+        assert!(expires_at <= after + chrono::Duration::seconds(121));
     }
 
     #[test]
     fn refresh_cookie_merge_preserves_existing_cookies() {
-        let now = Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 0).unwrap();
-        let cookie = SessionCookie::new("session=s%3Aold; aux=keep");
-        let changed = cookie.merge(
-            vec![parse_cookie_header(
+        let cookie = session_cookie("session=s%3Aold; aux=keep");
+        let changed = cookie
+            .merge(&[HeaderValue::from_static(
                 "theme=dark; Path=/; HttpOnly; SameSite=Lax",
-                now,
-            )],
-            now,
-        );
+            )])
+            .unwrap();
 
         assert!(changed);
-        assert_eq!(cookie.get(), "session=s%3Aold; aux=keep; theme=dark");
+        assert_eq!(
+            cookie_pairs(&cookie),
+            ["aux=keep", "session=s%3Aold", "theme=dark"]
+        );
     }
 
     #[test]
     fn refresh_cookie_merge_replaces_cookie_by_name() {
-        let now = Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 0).unwrap();
-        let cookie = SessionCookie::new("session=s%3Aold; aux=keep");
-        let changed = cookie.merge(
-            vec![parse_cookie_header(
-                "session=s%3Anew; Path=/; Expires=Wed, 22 Jul 2026 12:00:00 GMT; HttpOnly",
-                now,
-            )],
-            now,
-        );
+        let cookie = session_cookie("session=s%3Aold; aux=keep");
+        let changed = cookie
+            .merge(&[HeaderValue::from_static(
+                "session=s%3Anew; Path=/; Expires=Mon, 22 Jul 2030 12:00:00 GMT; HttpOnly",
+            )])
+            .unwrap();
 
         assert!(changed);
-        assert_eq!(cookie.get(), "session=s%3Anew; aux=keep");
+        assert_eq!(cookie_pairs(&cookie), ["aux=keep", "session=s%3Anew"]);
         assert_eq!(
             cookie.expires_at(),
-            Some(Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).unwrap())
+            Some(Utc.with_ymd_and_hms(2030, 7, 22, 12, 0, 0).unwrap())
         );
     }
 
     #[test]
     fn refresh_cookie_merge_removes_expired_cookie_by_name() {
-        let now = Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 0).unwrap();
-        let cookie = SessionCookie::new("session=s%3Aold; aux=remove");
-        let changed = cookie.merge(
-            vec![parse_cookie_header(
+        let cookie = session_cookie("session=s%3Aold; aux=remove");
+        let changed = cookie
+            .merge(&[HeaderValue::from_static(
                 "aux=deleted; Path=/; Expires=Wed, 01 Jan 2020 00:00:00 GMT",
-                now,
-            )],
-            now,
-        );
+            )])
+            .unwrap();
 
         assert!(changed);
         assert_eq!(cookie.get(), "session=s%3Aold");
@@ -401,8 +314,13 @@ mod tests {
 
     #[test]
     fn refresh_delay_uses_cookie_expiry_before_fallback() {
-        let now = Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 0).unwrap();
-        let cookie = SessionCookie::new("session=s%3Aabc; Expires=Wed, 22 Jul 2026 12:00:00 GMT");
+        let now = Utc.with_ymd_and_hms(2030, 7, 19, 12, 0, 0).unwrap();
+        let cookie = session_cookie("session=s%3Aabc");
+        cookie
+            .merge(&[HeaderValue::from_static(
+                "session=s%3Aabc; Path=/; Expires=Mon, 22 Jul 2030 12:00:00 GMT",
+            )])
+            .unwrap();
 
         assert_eq!(
             next_refresh_delay(&cookie, now).unwrap(),
@@ -413,7 +331,7 @@ mod tests {
     #[test]
     fn refresh_delay_rejects_cookies_without_expiry() {
         let now = Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 0).unwrap();
-        let cookie = SessionCookie::new("session=s%3Aabc");
+        let cookie = session_cookie("session=s%3Aabc");
 
         assert!(next_refresh_delay(&cookie, now).is_err());
         assert!(ensure_cookie_has_expiry(&cookie).is_err());
@@ -434,5 +352,19 @@ mod tests {
     #[test]
     fn recent_json_validation_rejects_login_or_wrong_shape() {
         assert!(validate_recent_json(&json!({"login": true})).is_err());
+    }
+
+    fn session_cookie(value: &str) -> SessionCookie {
+        SessionCookie::new(value, "https://ptchan.test").unwrap()
+    }
+
+    fn cookie_pairs(cookie: &SessionCookie) -> Vec<String> {
+        let mut pairs = cookie
+            .get()
+            .split("; ")
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        pairs.sort();
+        pairs
     }
 }

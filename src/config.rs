@@ -1,25 +1,24 @@
-use std::{collections::HashSet, env, fs, net::SocketAddr, str::FromStr, time::Duration};
+use std::{env, net::SocketAddr, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{de::Error as DeError, Deserialize, Deserializer};
 use tracing_subscriber::{fmt, EnvFilter};
+
+mod file;
+mod validation;
+
+pub(crate) use file::load_from_env;
 
 const POSTING_NAME_MAX_CHARS: usize = 25;
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 pub(crate) struct Config {
     pub(crate) ptchan: PtchanConfig,
-    #[serde(default)]
     pub(crate) runtime: RuntimeConfig,
     pub(crate) storage: StorageConfig,
-    #[serde(default)]
-    pub(crate) integration: Vec<IntegrationConfig>,
-    #[serde(skip)]
-    pub(crate) webhook: Vec<WebhookConfig>,
-    #[serde(skip)]
-    pub(crate) posting: Vec<PostingConfig>,
-    #[serde(skip)]
+    pub(crate) integrations: Vec<IntegrationConfig>,
+    pub(crate) webhooks: Vec<WebhookConfig>,
+    pub(crate) postings: Vec<PostingConfig>,
     pub(crate) fingerprint_secret: Option<String>,
 }
 
@@ -27,38 +26,14 @@ pub(crate) struct Config {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PtchanConfig {
     pub(crate) base_url: String,
-    #[serde(default = "gateway_user_agent")]
-    pub(crate) user_agent: String,
-    #[serde(
-        default = "default_reconnect_min",
-        deserialize_with = "duration_from_str"
-    )]
-    pub(crate) socket_reconnect_min: Duration,
-    #[serde(
-        default = "default_reconnect_max",
-        deserialize_with = "duration_from_str"
-    )]
-    pub(crate) socket_reconnect_max: Duration,
 }
 
 #[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct RuntimeConfig {
-    #[serde(default = "default_http_addr")]
     pub(crate) http_addr: String,
-    #[serde(default)]
     pub(crate) logging: LoggingConfig,
-    #[serde(default)]
     pub(crate) rate_limit: RuntimeRateLimitConfig,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct LoggingConfig {
-    #[serde(default = "default_log_level")]
-    pub(crate) level: String,
-    #[serde(default, deserialize_with = "log_format_from_str")]
-    pub(crate) format: LogFormat,
 }
 
 impl Default for RuntimeConfig {
@@ -71,6 +46,13 @@ impl Default for RuntimeConfig {
     }
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct LoggingConfig {
+    pub(crate) level: String,
+    pub(crate) format: LogFormat,
+}
+
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
@@ -80,12 +62,18 @@ impl Default for LoggingConfig {
     }
 }
 
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum LogFormat {
+    #[default]
+    Json,
+    Text,
+}
+
 #[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct RuntimeRateLimitConfig {
-    #[serde(default = "default_global_reading_rate_limit")]
     pub(crate) reading: RateLimitBucketConfig,
-    #[serde(default = "default_global_posting_rate_limit")]
     pub(crate) posting: RateLimitBucketConfig,
 }
 
@@ -94,25 +82,6 @@ impl Default for RuntimeRateLimitConfig {
         Self {
             reading: default_global_reading_rate_limit(),
             posting: default_global_posting_rate_limit(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-pub(crate) enum LogFormat {
-    #[default]
-    Json,
-    Text,
-}
-
-impl FromStr for LogFormat {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "json" => Ok(Self::Json),
-            "text" => Ok(Self::Text),
-            other => Err(anyhow!("unsupported log format {other}; use text or json")),
         }
     }
 }
@@ -128,84 +97,25 @@ pub(crate) struct StorageConfig {
     pub(crate) event_retention: Duration,
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 pub(crate) struct IntegrationConfig {
     pub(crate) name: String,
-    #[serde(default)]
     pub(crate) allowed_boards: Vec<String>,
-    #[serde(default)]
-    pub(crate) reading: Option<ReadingCapabilityConfig>,
-    #[serde(default)]
-    pub(crate) webhook: Option<WebhookCapabilityConfig>,
-    #[serde(default)]
-    pub(crate) posting: Option<PostingCapabilityConfig>,
-    #[serde(default)]
+    pub(crate) reading: bool,
     pub(crate) rate_limit: RateLimitConfig,
-    #[serde(skip)]
     pub(crate) secret: String,
 }
 
 impl IntegrationConfig {
-    pub(crate) fn reading_enabled(&self) -> bool {
-        self.reading.is_some()
-    }
-
     pub(crate) fn board_allowed(&self, board: &str) -> bool {
         board_allowed(&self.allowed_boards, board)
     }
 }
 
-pub(crate) fn board_allowed(allowed_boards: &[String], board: &str) -> bool {
-    allowed_boards.is_empty()
-        || allowed_boards
-            .iter()
-            .any(|allowed_board| allowed_board == board)
-}
-
 #[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReadingCapabilityConfig {}
-
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct WebhookCapabilityConfig {
-    pub(crate) url: String,
-    #[serde(default)]
-    pub(crate) include_poster_fingerprint: bool,
-    #[serde(
-        default = "default_webhook_timeout",
-        deserialize_with = "duration_from_str"
-    )]
-    pub(crate) timeout: Duration,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PostingCapabilityConfig {
-    #[serde(default)]
-    pub(crate) display_name: Option<String>,
-    #[serde(default)]
-    pub(crate) use_tripcode: bool,
-    #[serde(default)]
-    pub(crate) use_post_password: bool,
-    #[serde(skip)]
-    pub(crate) tripcode: Option<String>,
-    #[serde(skip)]
-    pub(crate) post_password: Option<String>,
-    #[serde(
-        default = "default_posting_timeout",
-        deserialize_with = "duration_from_str"
-    )]
-    pub(crate) timeout: Duration,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct RateLimitConfig {
-    #[serde(default)]
     pub(crate) reading: RateLimitBucketConfig,
-    #[serde(default = "default_posting_rate_limit")]
     pub(crate) posting: RateLimitBucketConfig,
 }
 
@@ -244,7 +154,12 @@ pub(crate) struct WebhookConfig {
     pub(crate) allowed_boards: Vec<String>,
     pub(crate) include_poster_fingerprint: bool,
     pub(crate) secret: String,
-    pub(crate) timeout: Duration,
+}
+
+impl WebhookConfig {
+    pub(crate) fn board_allowed(&self, board: &str) -> bool {
+        board_allowed(&self.allowed_boards, board)
+    }
 }
 
 #[derive(Clone)]
@@ -253,225 +168,35 @@ pub(crate) struct PostingConfig {
     pub(crate) allowed_boards: Vec<String>,
     pub(crate) display_name: Option<String>,
     pub(crate) secret: String,
-    pub(crate) tripcode: Option<String>,
-    pub(crate) post_password: Option<String>,
-    pub(crate) timeout: Duration,
+    pub(crate) tripcode_secret: String,
+    pub(crate) public_tripcode: String,
+    pub(crate) post_password: String,
 }
 
-impl Config {
-    pub(crate) fn load_from_env() -> Result<Self> {
-        let path = env::var("CONFIG_FILE").unwrap_or_else(|_| "config/dev.toml".to_string());
-        let raw = fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
-        let mut cfg: Config = toml::from_str(&raw).with_context(|| format!("parse {path}"))?;
-        if let Ok(sqlite_path) = env::var("SQLITE_PATH") {
-            if !sqlite_path.trim().is_empty() {
-                cfg.storage.sqlite_path = sqlite_path;
-            }
-        }
-        cfg.validate().context("validate config")?;
-        for integration in &mut cfg.integration {
-            let env_name = integration_secret_env(&integration.name);
-            integration.secret = env::var(&env_name).with_context(|| {
-                format!(
-                    "integration {} secret env {} is not set",
-                    integration.name, env_name
-                )
-            })?;
-            if integration.secret.trim().is_empty() {
-                return Err(anyhow!(
-                    "integration {} secret env {} is empty",
-                    integration.name,
-                    env_name
-                ));
-            }
-            if let Some(posting) = &mut integration.posting {
-                if posting.use_tripcode {
-                    let env_name = integration_tripcode_env(&integration.name);
-                    let tripcode = env::var(&env_name).with_context(|| {
-                        format!(
-                            "integration {} tripcode env {} is not set",
-                            integration.name, env_name
-                        )
-                    })?;
-                    if tripcode.trim().is_empty() {
-                        return Err(anyhow!(
-                            "integration {} tripcode env {} is empty",
-                            integration.name,
-                            env_name
-                        ));
-                    }
-                    posting.tripcode = Some(tripcode);
-                }
-                if posting.use_post_password {
-                    let env_name = integration_post_password_env(&integration.name);
-                    let post_password = env::var(&env_name).with_context(|| {
-                        format!(
-                            "integration {} post password env {} is not set",
-                            integration.name, env_name
-                        )
-                    })?;
-                    if post_password.trim().is_empty() {
-                        return Err(anyhow!(
-                            "integration {} post password env {} is empty",
-                            integration.name,
-                            env_name
-                        ));
-                    }
-                    posting.post_password = Some(post_password);
-                }
-            }
-        }
-        cfg.validate().context("validate loaded config")?;
-        cfg.webhook = cfg.webhooks();
-        cfg.posting = cfg.postings();
-        if cfg.webhook.iter().any(|wh| wh.include_poster_fingerprint) {
-            let secret = env::var("PTCHAN_FINGERPRINT_SECRET")
-                .context("fingerprint env PTCHAN_FINGERPRINT_SECRET is not set")?;
-            if secret.trim().is_empty() {
-                return Err(anyhow!(
-                    "fingerprint env PTCHAN_FINGERPRINT_SECRET is empty"
-                ));
-            }
-            cfg.fingerprint_secret = Some(secret);
-        }
-        Ok(cfg)
+impl PostingConfig {
+    pub(crate) fn board_allowed(&self, board: &str) -> bool {
+        board_allowed(&self.allowed_boards, board)
     }
 
-    fn webhooks(&self) -> Vec<WebhookConfig> {
-        self.integration
-            .iter()
-            .filter_map(|integration| {
-                let webhook = integration.webhook.as_ref()?;
-                Some(WebhookConfig {
-                    name: integration.name.clone(),
-                    url: webhook.url.clone(),
-                    allowed_boards: integration.allowed_boards.clone(),
-                    include_poster_fingerprint: webhook.include_poster_fingerprint,
-                    secret: integration.secret.clone(),
-                    timeout: webhook.timeout,
-                })
-            })
-            .collect()
-    }
-
-    fn postings(&self) -> Vec<PostingConfig> {
-        self.integration
-            .iter()
-            .filter_map(|integration| {
-                let posting = integration.posting.as_ref()?;
-                Some(PostingConfig {
-                    name: integration.name.clone(),
-                    allowed_boards: integration.allowed_boards.clone(),
-                    display_name: posting.display_name.clone(),
-                    secret: integration.secret.clone(),
-                    tripcode: posting.tripcode.clone(),
-                    post_password: posting.post_password.clone(),
-                    timeout: posting.timeout,
-                })
-            })
-            .collect()
-    }
-
-    pub(crate) fn validate(&self) -> Result<()> {
-        if self.ptchan.base_url.trim().is_empty() {
-            return Err(anyhow!("ptchan.base_url is required"));
-        }
-        reqwest::Url::parse(&self.ptchan.base_url)
-            .context("ptchan.base_url must be an absolute URL")?;
-        if self.ptchan.user_agent.trim().is_empty() {
-            return Err(anyhow!("ptchan.user_agent is required"));
-        }
-        if self.ptchan.socket_reconnect_min.is_zero() {
-            return Err(anyhow!(
-                "ptchan.socket_reconnect_min must be greater than zero"
-            ));
-        }
-        if self.ptchan.socket_reconnect_max < self.ptchan.socket_reconnect_min {
-            return Err(anyhow!(
-                "ptchan.socket_reconnect_max must be greater than or equal to ptchan.socket_reconnect_min"
-            ));
-        }
-        runtime_addr(&self.runtime.http_addr).context("runtime.http_addr is invalid")?;
-        if self.storage.sqlite_path.trim().is_empty() {
-            return Err(anyhow!("storage.sqlite_path is required"));
-        }
-        if self.storage.event_retention.is_zero() {
-            return Err(anyhow!("storage.event_retention must be greater than zero"));
-        }
-        validate_rate_limit_bucket("runtime", "reading", &self.runtime.rate_limit.reading)?;
-        validate_rate_limit_bucket("runtime", "posting", &self.runtime.rate_limit.posting)?;
-        let mut names = HashSet::new();
-        let mut env_names = HashSet::new();
-        for integration in &self.integration {
-            if integration.name.trim().is_empty() {
-                return Err(anyhow!("integration.name is required"));
-            }
-            if !valid_integration_name(&integration.name) {
-                return Err(anyhow!(
-                    "integration name {} is invalid; use 1-64 ASCII letters, digits, underscores, or hyphens",
-                    integration.name
-                ));
-            }
-            if !names.insert(integration.name.as_str()) {
-                return Err(anyhow!("duplicate integration name {}", integration.name));
-            }
-            let env_name = env_safe_name(&integration.name);
-            if !env_names.insert(env_name) {
-                return Err(anyhow!(
-                    "integration name {} conflicts with another integration environment name",
-                    integration.name
-                ));
-            }
-            if integration.reading.is_none()
-                && integration.webhook.is_none()
-                && integration.posting.is_none()
-            {
-                return Err(anyhow!(
-                    "integration {} must enable at least one capability",
-                    integration.name
-                ));
-            }
-            for board in &integration.allowed_boards {
-                if !valid_board_name(board) {
-                    return Err(anyhow!(
-                        "integration {} allowed board {} is invalid",
-                        integration.name,
-                        board
-                    ));
-                }
-            }
-            if let Some(webhook) = &integration.webhook {
-                reqwest::Url::parse(&webhook.url).with_context(|| {
-                    format!(
-                        "integration {} webhook url must be absolute",
-                        integration.name
-                    )
-                })?;
-                if webhook.timeout.is_zero() {
-                    return Err(anyhow!(
-                        "integration {} webhook timeout must be greater than zero",
-                        integration.name
-                    ));
-                }
-            }
-            if let Some(posting) = &integration.posting {
-                validate_posting(&integration.name, posting)?;
-            }
-            validate_rate_limit(&integration.name, &integration.rate_limit)?;
-        }
-        Ok(())
+    pub(crate) fn form_name(&self) -> String {
+        let name = self.display_name.as_deref().unwrap_or(&self.name).trim();
+        format!("{name}##{}", self.tripcode_secret)
     }
 }
 
 pub(crate) fn ptchan_session_cookie() -> Result<String> {
-    let cookie = env::var("PTCHAN_SESSION_COOKIE")
-        .context("ptchan session cookie env PTCHAN_SESSION_COOKIE is not set")?;
-    if cookie.trim().is_empty() {
-        return Err(anyhow!(
-            "ptchan session cookie env PTCHAN_SESSION_COOKIE is empty"
-        ));
+    required_env(
+        "PTCHAN_SESSION_COOKIE",
+        "ptchan session cookie env PTCHAN_SESSION_COOKIE",
+    )
+}
+
+fn required_env(name: &str, description: &str) -> Result<String> {
+    let value = env::var(name).with_context(|| format!("{description} is not set"))?;
+    if value.trim().is_empty() {
+        return Err(anyhow!("{description} is empty"));
     }
-    Ok(cookie)
+    Ok(value)
 }
 
 fn integration_secret_env(name: &str) -> String {
@@ -498,74 +223,24 @@ fn env_safe_name(name: &str) -> String {
         .collect()
 }
 
-fn posting_form_name(integration_name: &str, posting: &PostingCapabilityConfig) -> Option<String> {
-    let name = posting
-        .display_name
-        .as_deref()
-        .unwrap_or(integration_name)
-        .trim();
-    match posting.tripcode.as_deref() {
-        Some(tripcode) => Some(format!("{name}##{tripcode}")),
-        None if name.is_empty() => None,
-        None => Some(name.to_string()),
-    }
+fn board_allowed(allowed_boards: &[String], board: &str) -> bool {
+    allowed_boards.is_empty()
+        || allowed_boards
+            .iter()
+            .any(|allowed_board| allowed_board == board)
 }
 
-fn validate_posting(integration_name: &str, posting: &PostingCapabilityConfig) -> Result<()> {
-    if posting.timeout.is_zero() {
-        return Err(anyhow!(
-            "integration {integration_name} posting timeout must be greater than zero"
-        ));
-    }
-    if matches!(posting.display_name.as_deref(), Some(name) if name.trim().is_empty()) {
-        return Err(anyhow!(
-            "integration {integration_name} posting display_name must not be empty"
-        ));
-    }
-    let Some(name) = posting_form_name(integration_name, posting) else {
-        return Ok(());
+fn valid_public_tripcode(tripcode: &str) -> bool {
+    let Some(encoded) = tripcode
+        .strip_prefix("!!")
+        .and_then(|value| value.strip_suffix('='))
+    else {
+        return false;
     };
-    let name_len = name.chars().count();
-    if name_len > POSTING_NAME_MAX_CHARS {
-        return Err(anyhow!(
-            "integration {integration_name} posting name is {name_len} characters; ptchan allows {POSTING_NAME_MAX_CHARS} or less"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_rate_limit(integration_name: &str, rate_limit: &RateLimitConfig) -> Result<()> {
-    let owner = format!("integration {integration_name}");
-    validate_rate_limit_bucket(&owner, "reading", &rate_limit.reading)?;
-    validate_rate_limit_bucket(&owner, "posting", &rate_limit.posting)
-}
-
-fn validate_rate_limit_bucket(
-    owner: &str,
-    capability: &str,
-    rate_limit: &RateLimitBucketConfig,
-) -> Result<()> {
-    if rate_limit.requests == 0 {
-        return Err(anyhow!(
-            "{owner} rate_limit.{capability} requests must be greater than zero"
-        ));
-    }
-    if rate_limit.window.is_zero() {
-        return Err(anyhow!(
-            "{owner} rate_limit.{capability} window must be greater than zero"
-        ));
-    }
-    if rate_limit.burst == 0 || rate_limit.burst > rate_limit.requests {
-        return Err(anyhow!(
-            "{owner} rate_limit.{capability} burst must be positive and no greater than requests"
-        ));
-    }
-    if (rate_limit.window / rate_limit.requests).is_zero() {
-        return Err(anyhow!(
-            "{owner} rate_limit.{capability} window is too small for the configured request count"
-        ));
-    }
-    Ok(())
+    encoded.len() == 9
+        && encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
 }
 
 pub(crate) fn valid_board_name(board: &str) -> bool {
@@ -592,24 +267,15 @@ pub(crate) fn init_logging(cfg: &LoggingConfig) -> Result<()> {
         LogFormat::Json => fmt().json().with_env_filter(filter).init(),
         LogFormat::Text => fmt().with_env_filter(filter).init(),
     }
-
     Ok(())
-}
-
-fn log_format_from_str<'de, D>(deserializer: D) -> std::result::Result<LogFormat, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    value.parse().map_err(serde::de::Error::custom)
 }
 
 fn duration_from_str<'de, D>(deserializer: D) -> std::result::Result<Duration, D::Error>
 where
-    D: serde::Deserializer<'de>,
+    D: Deserializer<'de>,
 {
     let value = String::deserialize(deserializer)?;
-    humantime::parse_duration(&value).map_err(serde::de::Error::custom)
+    humantime::parse_duration(&value).map_err(DeError::custom)
 }
 
 pub(crate) fn runtime_addr(addr: &str) -> Result<SocketAddr> {
@@ -627,33 +293,26 @@ pub(crate) fn gateway_user_agent() -> String {
     format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
 }
 
-fn default_reconnect_min() -> Duration {
-    Duration::from_secs(3)
-}
-fn default_reconnect_max() -> Duration {
-    Duration::from_mins(1)
-}
 fn default_http_addr() -> String {
     "0.0.0.0:8080".to_string()
 }
+
 fn default_log_level() -> String {
     "info".to_string()
 }
-fn default_webhook_timeout() -> Duration {
-    Duration::from_secs(10)
-}
-fn default_posting_timeout() -> Duration {
-    Duration::from_secs(15)
-}
+
 fn default_reading_rate_limit_requests() -> u32 {
     120
 }
+
 fn default_rate_limit_window() -> Duration {
     Duration::from_secs(60)
 }
+
 fn default_reading_rate_limit_burst() -> u32 {
     30
 }
+
 fn default_posting_rate_limit() -> RateLimitBucketConfig {
     RateLimitBucketConfig {
         requests: 30,
@@ -661,6 +320,7 @@ fn default_posting_rate_limit() -> RateLimitBucketConfig {
         burst: 5,
     }
 }
+
 fn default_global_reading_rate_limit() -> RateLimitBucketConfig {
     RateLimitBucketConfig {
         requests: 1_000,
@@ -668,6 +328,7 @@ fn default_global_reading_rate_limit() -> RateLimitBucketConfig {
         burst: 200,
     }
 }
+
 fn default_global_posting_rate_limit() -> RateLimitBucketConfig {
     RateLimitBucketConfig {
         requests: 100,
@@ -675,253 +336,10 @@ fn default_global_posting_rate_limit() -> RateLimitBucketConfig {
         burst: 20,
     }
 }
+
 fn default_event_retention() -> Duration {
     Duration::from_hours(14 * 24)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validates_runtime_address() {
-        let mut cfg = valid_config();
-        cfg.runtime.http_addr = "not-an-address".to_string();
-
-        let err = cfg.validate().unwrap_err();
-
-        assert!(err.to_string().contains("runtime.http_addr is invalid"));
-    }
-
-    #[test]
-    fn validates_reconnect_range() {
-        let mut cfg = valid_config();
-        cfg.ptchan.socket_reconnect_min = Duration::from_secs(10);
-        cfg.ptchan.socket_reconnect_max = Duration::from_secs(3);
-
-        let err = cfg.validate().unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("ptchan.socket_reconnect_max must be greater than or equal"));
-    }
-
-    #[test]
-    fn validates_webhook_timeout() {
-        let mut cfg = valid_config();
-        cfg.integration[0].webhook.as_mut().unwrap().timeout = Duration::ZERO;
-
-        let err = cfg.validate().unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("integration example webhook timeout must be greater than zero"));
-    }
-
-    #[test]
-    fn validates_posting_name_length_after_tripcode() {
-        let mut cfg = valid_config();
-        cfg.integration[0].posting = Some(PostingCapabilityConfig {
-            display_name: Some("ptchan-gateway".to_string()),
-            use_tripcode: true,
-            use_post_password: false,
-            tripcode: Some("this-is-an-example-ok".to_string()),
-            post_password: None,
-            timeout: Duration::from_secs(15),
-        });
-
-        let err = cfg.validate().unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("integration example posting name is"));
-    }
-
-    #[test]
-    fn validates_integration_rate_limit() {
-        let mut cfg = valid_config();
-        cfg.integration[0].rate_limit.reading.burst = 0;
-
-        let err = cfg.validate().unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("integration example rate_limit.reading burst"));
-
-        cfg.integration[0].rate_limit.reading.burst =
-            cfg.integration[0].rate_limit.reading.requests + 1;
-        let err = cfg.validate().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("integration example rate_limit.reading burst"));
-
-        cfg.integration[0].rate_limit.reading.burst = 1;
-        cfg.integration[0].rate_limit.reading.requests = 2_000_000_000;
-        cfg.integration[0].rate_limit.reading.window = Duration::from_secs(1);
-        let err = cfg.validate().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("integration example rate_limit.reading window is too small"));
-
-        let mut cfg = valid_config();
-        cfg.integration[0].rate_limit.posting.burst = 0;
-        let err = cfg.validate().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("integration example rate_limit.posting burst"));
-    }
-
-    #[test]
-    fn validates_integration_names_for_env_and_metrics() {
-        let mut cfg = valid_config();
-        cfg.integration[0].name = "bad name".to_string();
-
-        assert!(cfg
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("integration name bad name is invalid"));
-    }
-
-    #[test]
-    fn rejects_integration_env_name_collisions() {
-        let mut cfg = valid_config();
-        cfg.integration.push(IntegrationConfig {
-            name: "example-test".to_string(),
-            allowed_boards: Vec::new(),
-            reading: Some(ReadingCapabilityConfig {}),
-            webhook: None,
-            posting: None,
-            rate_limit: RateLimitConfig::default(),
-            secret: String::new(),
-        });
-        cfg.integration[0].name = "example_test".to_string();
-
-        assert!(cfg
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("conflicts with another integration environment name"));
-    }
-
-    #[test]
-    fn parses_log_format() {
-        assert!(matches!(
-            "json".parse::<LogFormat>().unwrap(),
-            LogFormat::Json
-        ));
-        assert!(matches!(
-            "text".parse::<LogFormat>().unwrap(),
-            LogFormat::Text
-        ));
-        assert!("pretty".parse::<LogFormat>().is_err());
-    }
-
-    #[test]
-    fn defaults_runtime_and_logging_sections() {
-        let raw = r#"
-[ptchan]
-base_url = "https://ptchan.test"
-
-[storage]
-sqlite_path = "data/test.db"
-"#;
-
-        let cfg = toml::from_str::<Config>(raw).unwrap();
-
-        assert_eq!(cfg.runtime.http_addr, "0.0.0.0:8080");
-        assert_eq!(cfg.runtime.logging.level, "info");
-        assert!(matches!(cfg.runtime.logging.format, LogFormat::Json));
-        assert_eq!(cfg.runtime.rate_limit.reading.requests, 1_000);
-        assert_eq!(cfg.runtime.rate_limit.reading.burst, 200);
-        assert_eq!(cfg.runtime.rate_limit.posting.requests, 100);
-        assert_eq!(cfg.runtime.rate_limit.posting.burst, 20);
-    }
-
-    #[test]
-    fn reading_capability_is_enabled_by_section_presence() {
-        let raw = r#"
-[ptchan]
-base_url = "https://ptchan.test"
-
-[[integration]]
-name = "example"
-
-[integration.reading]
-
-[storage]
-sqlite_path = "data/test.db"
-"#;
-
-        let cfg = toml::from_str::<Config>(raw).unwrap();
-
-        assert!(cfg.integration[0].reading_enabled());
-        assert_eq!(cfg.integration[0].rate_limit.reading.requests, 120);
-        assert_eq!(
-            cfg.integration[0].rate_limit.reading.window,
-            Duration::from_secs(60)
-        );
-        assert_eq!(cfg.integration[0].rate_limit.reading.burst, 30);
-        assert_eq!(cfg.integration[0].rate_limit.posting.requests, 30);
-        assert_eq!(
-            cfg.integration[0].rate_limit.posting.window,
-            Duration::from_secs(60)
-        );
-        assert_eq!(cfg.integration[0].rate_limit.posting.burst, 5);
-        assert!(toml::from_str::<Config>(
-            r#"
-[ptchan]
-base_url = "https://ptchan.test"
-
-[[integration]]
-name = "example"
-
-[integration.reading]
-enabled = true
-
-[storage]
-sqlite_path = "data/test.db"
-"#
-        )
-        .is_err());
-    }
-
-    fn valid_config() -> Config {
-        Config {
-            ptchan: PtchanConfig {
-                base_url: "https://ptchan.test".to_string(),
-                user_agent: "ptchan-gateway-test".to_string(),
-                socket_reconnect_min: Duration::from_secs(3),
-                socket_reconnect_max: Duration::from_mins(1),
-            },
-            runtime: RuntimeConfig {
-                http_addr: "127.0.0.1:8080".to_string(),
-                logging: LoggingConfig {
-                    level: "info".to_string(),
-                    format: LogFormat::Json,
-                },
-                rate_limit: RuntimeRateLimitConfig::default(),
-            },
-            storage: StorageConfig {
-                sqlite_path: "data/test.db".to_string(),
-                event_retention: Duration::from_hours(14 * 24),
-            },
-            integration: vec![IntegrationConfig {
-                name: "example".to_string(),
-                allowed_boards: Vec::new(),
-                reading: Some(ReadingCapabilityConfig {}),
-                webhook: Some(WebhookCapabilityConfig {
-                    url: "http://127.0.0.1:8081/events".to_string(),
-                    include_poster_fingerprint: false,
-                    timeout: Duration::from_secs(10),
-                }),
-                posting: None,
-                rate_limit: RateLimitConfig::default(),
-                secret: String::new(),
-            }],
-            webhook: Vec::new(),
-            posting: Vec::new(),
-            fingerprint_secret: None,
-        }
-    }
-}
+mod tests;

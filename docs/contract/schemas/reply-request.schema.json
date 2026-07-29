@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReplyRequest",
+  "description": "Signed request body for creating a public reply.",
+  "type": "object",
+  "properties": {
+    "message": {
+      "description": "Public post body, limited to 8,000 UTF-8 bytes.",
+      "type": "string"
+    },
+    "sage": {
+      "description": "Whether to submit `sage` through the public posting form.",
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "message"
+  ]
+}
