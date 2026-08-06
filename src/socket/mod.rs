@@ -36,7 +36,7 @@ mod protocol;
 
 const ROOM: &str = "globalmanage-recent-hashed";
 const RECONNECT_MIN: Duration = Duration::from_secs(3);
-const RECONNECT_MAX: Duration = Duration::from_secs(60);
+const RECONNECT_MAX: Duration = Duration::from_mins(1);
 pub(crate) struct Supervisor {
     pub(crate) cfg: PtchanConfig,
     pub(crate) cookie: Arc<SessionCookie>,

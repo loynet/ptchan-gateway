@@ -433,7 +433,7 @@ mod tests {
             .is_empty());
         assert_eq!(
             store.next_delivery_delay(now).await.unwrap(),
-            Some(Duration::from_secs(60))
+            Some(Duration::from_mins(1))
         );
         let retry = store.pending_deliveries(10, retry_at).await.unwrap();
         assert_eq!(retry.len(), 1);

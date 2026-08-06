@@ -153,12 +153,12 @@ mod tests {
             &RuntimeRateLimitConfig {
                 reading: RateLimitBucketConfig {
                     requests: 1,
-                    window: Duration::from_secs(60),
+                    window: Duration::from_mins(1),
                     burst: 1,
                 },
                 posting: RateLimitBucketConfig {
                     requests: 10,
-                    window: Duration::from_secs(60),
+                    window: Duration::from_mins(1),
                     burst: 10,
                 },
             },
@@ -188,12 +188,12 @@ mod tests {
             rate_limit: RateLimitConfig {
                 reading: RateLimitBucketConfig {
                     requests: 1,
-                    window: Duration::from_secs(60),
+                    window: Duration::from_mins(1),
                     burst: 1,
                 },
                 posting: RateLimitBucketConfig {
                     requests: 1,
-                    window: Duration::from_secs(60),
+                    window: Duration::from_mins(1),
                     burst: 1,
                 },
             },
@@ -205,12 +205,12 @@ mod tests {
         RuntimeRateLimitConfig {
             reading: RateLimitBucketConfig {
                 requests: 10,
-                window: Duration::from_secs(60),
+                window: Duration::from_mins(1),
                 burst: 10,
             },
             posting: RateLimitBucketConfig {
                 requests: 10,
-                window: Duration::from_secs(60),
+                window: Duration::from_mins(1),
                 burst: 10,
             },
         }

@@ -480,7 +480,7 @@ mod tests {
     fn one_request_integration(reading: bool) -> IntegrationConfig {
         let bucket = RateLimitBucketConfig {
             requests: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
             burst: 1,
         };
         IntegrationConfig {

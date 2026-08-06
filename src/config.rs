@@ -306,7 +306,7 @@ fn default_reading_rate_limit_requests() -> u32 {
 }
 
 fn default_rate_limit_window() -> Duration {
-    Duration::from_secs(60)
+    Duration::from_mins(1)
 }
 
 fn default_reading_rate_limit_burst() -> u32 {

@@ -238,7 +238,7 @@ sqlite_path = "data/test.db"
     assert_eq!(config.integrations[0].rate_limit.reading.requests, 120);
     assert_eq!(
         config.integrations[0].rate_limit.reading.window,
-        Duration::from_secs(60)
+        Duration::from_mins(1)
     );
     assert_eq!(config.integrations[0].rate_limit.reading.burst, 30);
     assert!(file::parse(

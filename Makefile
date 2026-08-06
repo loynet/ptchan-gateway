@@ -9,6 +9,8 @@ VOLUME ?= ptchan-gateway-$(GATEWAY_ENV)-data
 DOCKER_NETWORK ?=
 DOCKER_RUN_EXTRA ?=
 
+.DEFAULT_GOAL := verify
+
 LOAD_ENV = set -a; . ./$(ENV_FILE); set +a; \
 	CONFIG_FILE=$(CONFIG_FILE); \
 	SQLITE_PATH=$${SQLITE_PATH:-data/$(GATEWAY_ENV).db}; \
@@ -28,18 +30,68 @@ ifneq ($(strip $(DOCKER_NETWORK)),)
 DOCKER_NETWORK_FLAGS = --network $(DOCKER_NETWORK)
 endif
 
-.PHONY: check run db-reset build tools doctor docker-build docker-run docker-deploy docker-logs clean
+.PHONY: \
+	verify \
+	check \
+	format-check \
+	lint \
+	test \
+	contract-check \
+	config-check \
+	dependency-check \
+	release-check \
+	go-client \
+	run \
+	db-reset \
+	build \
+	tools \
+	doctor \
+	docker-build \
+	docker-run \
+	docker-deploy \
+	docker-logs \
+	clean
+
+verify:
+	$(MAKE) check
+	$(MAKE) release-check
 
 check:
+	$(MAKE) format-check
+	$(MAKE) lint
+	$(MAKE) test
+	$(MAKE) contract-check
+	$(MAKE) go-client
+	$(MAKE) config-check
+	$(MAKE) dependency-check
+
+format-check:
 	cargo fmt -- --check
+
+lint:
 	cargo clippy --all-targets --all-features -- -D warnings -W unreachable_pub -W clippy::pedantic -W clippy::cargo -A clippy::cargo-common-metadata -A clippy::multiple-crate-versions
+
+test:
 	cargo test
 	@if cargo metadata --no-deps --format-version 1 | rg '"kind":\["lib"\]' >/dev/null; then cargo test --doc; fi
+
+contract-check:
 	cargo run -- --check-contract
+
+config-check:
 	$(LOAD_ENV); cargo run -- --check-config
+
+dependency-check:
 	cargo machete
 	cargo deny check
+
+release-check:
 	cargo build --release --locked
+
+go-client:
+	cd clients/go && go mod tidy -diff
+	cd clients/go && go test ./...
+	cd clients/go && go vet ./...
 
 run:
 	$(LOAD_ENV); cargo run

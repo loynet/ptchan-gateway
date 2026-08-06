@@ -13,14 +13,18 @@ The running gateway also serves the OpenAPI document at:
 GET /integration/v1/openapi.json
 ```
 
+The supported Go implementation is
+[`clients/go`](../../clients/go/README.md). It is hand-written around this
+contract, and its tests read the canonical examples in this directory directly.
+
 Regenerate committed artifacts after an intentional contract change:
 
 ```bash
 cargo run -- --write-contract
 ```
 
-`make` runs `--check-contract` and fails when generated artifacts differ from
-the committed files.
+`make` runs `--check-contract`, then verifies the Go client against these
+artifacts.
 
 ## Compatibility
 

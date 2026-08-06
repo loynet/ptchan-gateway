@@ -1,103 +1,43 @@
 # ptchan-gateway
 
-`ptchan-gateway` gives trusted integrations a small, signed interface around
-ptchan.
+`ptchan-gateway` gives trusted integrations a small, signed, moderation-safe
+interface around ptchan. It delivers sanitized webhooks, serves sanitized thread
+reads, and submits narrowly scoped replies through ptchan's public posting form.
 
-It can:
+The gateway stores webhook delivery state in SQLite and exposes health,
+readiness, and Prometheus metrics.
 
-- listen for ptchan `newPost` events and deliver sanitized signed webhooks;
-- fetch sanitized thread state through a signed reading endpoint;
-- create narrowly scoped replies through ptchan's public posting form.
+## Boundaries
 
-The gateway stores delivery state in SQLite and exposes health, readiness, and
-Prometheus metrics.
+Integration payloads contain public post data: board and post coordinates, URLs,
+timestamps, public author labels, text, country, attachment count, quote
+relationships, and optional integration-scoped identity fields.
 
-## Safety Model
+They never contain raw IPs, cloaks, moderation hashes, session or permission
+state, raw upstream JSON, attachment metadata, cookies, signatures, or secrets.
 
-The gateway intentionally exposes less than ptchan knows.
+Posting is least-privilege: replies go to ptchan's public form endpoint without
+a management cookie. Normal board controls, including rate limits, CAPTCHA,
+locks, and reply limits, still apply.
 
-Webhook payloads and thread reads include public post data such as board,
-thread/post IDs, URLs, timestamps, subject/message text, public author labels,
-donor flag, country, attachment count, and quote relationships.
+Read the full [safety, delivery, and operations model](docs/operations.md)
+before deploying or building an integration.
 
-They do not include raw IPs, upstream cloaks, moderation hashes, session data,
-permission state, raw upstream JSON, file names, file hashes, cookies,
-signatures, or secrets.
+## Configure an integration
 
-Posting is least-privilege. Replies are sent to ptchan's public form endpoint
-without a management cookie, so normal board protections such as rate limits,
-captcha, block-bypass, locks, and reply limits still apply.
+An `[[integration]]` has a shared signing secret and any combination of:
 
-## Integrations
+- `reading` — signed sanitized thread reads;
+- `webhook` — durable signed event delivery;
+- `posting` — replies to existing threads only.
 
-Configuration is centered on `[[integration]]` entries. Each integration has
-one shared signing secret and any combination of capabilities:
-
-- `reading`: lets it fetch sanitized thread state.
-- `webhook`: sends it signed post events.
-- `posting`: lets it reply to existing threads.
-
-Integration names may use ASCII letters, digits, `_`, and `-`. They are used in
-environment variable names, metrics, and `origin` fields.
-
-`allowed_boards = []` means all boards. Otherwise the integration is limited to
-the listed boards for every enabled capability.
-
-Each integration also has signed API rate limits for reading and posting. By
-default the gateway allows 120 reads per 60 seconds with a burst of 30, and 30
-posts per 60 seconds with a burst of 5. Override them with
-`[integration.rate_limit.reading]` and `[integration.rate_limit.posting]`:
-
-```toml
-[integration.rate_limit.reading]
-requests = 120
-window = "60s"
-burst = 30
-
-[integration.rate_limit.posting]
-requests = 30
-window = "60s"
-burst = 5
-```
-
-The runtime also has global reading and posting rate limits across all
-integrations. Defaults are intentionally higher: 1,000 reads per 60 seconds
-with a burst of 200, and 100 posts per 60 seconds with a burst of 20.
-
-```toml
-[runtime.rate_limit.reading]
-requests = 1000
-window = "60s"
-burst = 200
-
-[runtime.rate_limit.posting]
-requests = 100
-window = "60s"
-burst = 20
-```
-
-Capabilities are enabled by including their section and disabled by omitting it.
-For example, omit `[integration.posting]` to reject signed posting requests for
-that integration. Omit `[integration.webhook]` to skip webhook delivery; if no
-webhooks are configured, the gateway does not start the management session or
-Socket.IO client.
-
-Example:
+`allowed_boards = []` allows every board; otherwise it applies to every enabled
+capability. Integration names may contain ASCII letters, digits, `_`, and `-`.
 
 ```toml
 [[integration]]
 name = "example"
 allowed_boards = ["test"]
-
-[integration.rate_limit.reading]
-requests = 120
-window = "60s"
-burst = 30
-
-[integration.rate_limit.posting]
-requests = 30
-window = "60s"
-burst = 5
 
 [integration.reading]
 
@@ -110,7 +50,7 @@ display_name = "gw"
 public_tripcode = "!!X8NXmAS44="
 ```
 
-Secrets live in the environment, not TOML:
+Keep secrets in the environment:
 
 ```text
 PTCHAN_INTEGRATION_EXAMPLE_SECRET=change-me
@@ -118,23 +58,18 @@ PTCHAN_INTEGRATION_EXAMPLE_TRIPCODE=change-me
 PTCHAN_INTEGRATION_EXAMPLE_POST_PASSWORD=change-me
 ```
 
-Every integration requires its shared signing secret. Every posting capability
-also requires its tripcode secret and post password. Startup fails before
-serving traffic if the TOML is invalid or any secret required by an enabled
-capability is missing or empty.
+Every integration needs its shared secret. Posting also needs its secure
+tripcode secret and post password. `PTCHAN_SESSION_COOKIE` is required only
+when at least one webhook is configured; reading and posting never use it.
+`PTCHAN_FINGERPRINT_SECRET` is required only for webhooks that enable
+`include_poster_fingerprint`.
 
-`PTCHAN_SESSION_COOKIE` is required only when at least one webhook capability is
-configured, because webhook delivery depends on the management event stream.
-Reading and posting do not use that cookie.
+Per-integration and global reading/posting rate limits are configured in TOML;
+see [config/example.toml](config/example.toml) for the defaults and complete
+shape. Startup validates enabled capabilities and required secrets before
+serving traffic.
 
-`PTCHAN_FINGERPRINT_SECRET` is required only when a webhook sets
-`include_poster_fingerprint = true`.
-
-`CONFIG_FILE` selects the TOML file and defaults to `config/dev.toml`.
-`SQLITE_PATH`, when non-empty, overrides `storage.sqlite_path`; other
-non-secret settings stay in TOML.
-
-## Run Locally
+## Run and verify
 
 ```bash
 cp .env.example .env.dev
@@ -143,285 +78,107 @@ make tools
 make run
 ```
 
-Useful checks:
-
-```bash
-make          # full verification
-make check    # same as make
-make build    # release build
-make db-reset # reset the local dev SQLite database
-make doctor   # show local tool versions
-cargo run -- --check-contract
+```text
+make check         formatting, lint, test, contract, config, dependency, and Go SDK checks
+make verify        complete local verification, including the release build
+make release-check compile the locked release binary
+make build         release build and copy the binary
+make db-reset      reset the selected local SQLite database
+make doctor        show local tool versions
 ```
 
-Use the consolidated client for local development or production smoke tests:
+GitHub Actions runs `check` as the pull-request merge gate and `release-check`
+after a merge reaches `main`, using cached Cargo and Go build state.
 
-```bash
-cargo run --example gateway_client -- health
-cargo run --example gateway_client -- read test 397 50
-cargo run --example gateway_client -- post test 397 "hello from gateway"
-cargo run --example gateway_client -- listen 127.0.0.1:8081
+## Integrate
+
+The supported Go SDK is the `clients/go` submodule:
+
+```go
+import "github.com/loynet/ptchan-gateway/clients/go"
 ```
 
-See [examples/README.md](examples/README.md) for environment configuration and
-stdin posting.
+It owns signing, webhook verification, bounded response reads, gateway error
+decoding, and documented response invariants. It does not own retries,
+idempotency, routing, or application policy. See its
+[README](clients/go/README.md), including runnable webhook and thread/reply
+examples. Releases use tags such as `clients/go/v0.1.0`.
 
-## Runtime Endpoints
+Run the examples from `clients/go`:
 
-- `GET /healthz`
-- `GET /readyz`
-- `GET /metrics`
+```text
+cd clients/go
+go run ./examples/webhook-receiver
+go run ./examples/thread-reply
+```
+
+## API and contract
+
+Runtime endpoints:
+
+- `GET /healthz`, `GET /readyz`, and `GET /metrics`
 - `GET /integration/v1/openapi.json`
 - `GET /integration/v1/threads/:board/:thread_id?limit=50`
 - `POST /integration/v1/threads/:board/:thread_id/replies`
 
-The integration read and reply endpoints require valid signed requests.
-`/healthz`, `/readyz`, `/metrics`, and the OpenAPI document do not use
-integration authentication and should be exposed only according to the
-deployment's operational network policy. In particular, `/metrics` includes
-configured integration names and requested board names as labels. Treat it as
-an internal endpoint: do not publish the runtime port directly, and restrict
-access to the Prometheus collector and trusted operators.
+The read and reply endpoints require signed requests. Health, readiness,
+metrics, and OpenAPI do not; expose them only to the appropriate operational
+network. In particular, metrics include configured integration and requested
+board labels, so keep them internal.
 
-Integration API requests use:
+The generated [OpenAPI](docs/contract/openapi.json),
+[schemas](docs/contract/schemas), and [canonical examples](docs/contract/examples)
+are the public v1 contract. Read [the contract guide](docs/contract/README.md)
+for signing, compatibility, wire details, and request-quota behavior.
 
-```http
-x-ptchan-integration: example
-x-ptchan-timestamp: 2026-07-19T12:00:00Z
-x-ptchan-signature: hmac-sha256=...
-```
+Posts made through the gateway retain their public `tripcode` and receive an
+`origin` only when that tripcode exactly matches a configured integration.
+Private tripcode secrets never enter integration payloads.
 
-The signed message for thread reads is:
+## Delivery semantics and recovery
 
-```text
-<timestamp>.<method>.<path-and-query>
-```
+V1 emits `thread.created` and `post.created`. Webhooks are durable,
+at-least-once, and best-effort ordered. Consumers must deduplicate using
+`event_id` / `x-ptchan-event-id`, tolerate duplicates and reordering, and use
+signed thread reads to reconcile known threads.
 
-The signed message for posting replies is:
+Durability starts after the gateway receives an upstream event and commits it to
+SQLite. Pending deliveries survive an unavailable integration endpoint as long
+as SQLite data is retained; an uncertain attempt can be delivered again.
 
-```text
-<timestamp>.<method>.<path-and-query>.<json body>
-```
+The upstream Socket.IO room is live, not replayable. Events created while the
+gateway, its management session, or its socket is unavailable are not backfilled
+after reconnect because the gateway never received or stored them. The current
+API has no thread enumeration or complete recovery feed.
 
-The checked-in [OpenAPI document](docs/contract/openapi.json), standalone
-[JSON Schemas](docs/contract/schemas), and canonical
-[examples](docs/contract/examples) are generated from the Rust wire types.
-The running service exposes the same OpenAPI document at
-`GET /integration/v1/openapi.json`. See
-[docs/contract/README.md](docs/contract/README.md) for compatibility and
-signing rules.
+The [operations guide](docs/operations.md) documents the storage boundary,
+retention behavior, least-privilege posting, and operational consequences in
+full.
 
-## Thread Reads
+Replies use a stable gateway error envelope. `reply_state_unknown` means ptchan
+may have accepted the post; inspect the thread before retrying. Uploads and new
+thread creation are intentionally out of scope.
 
-```http
-GET /integration/v1/threads/test/397?limit=50
-```
+## Operations
 
-The response is a sanitized thread with posts in chronological order. `limit`
-defaults to `50` and is capped at `200`.
-
-Gateway-side read rate limits return `429` with the same error envelope used by
-posting errors:
-
-```json
-{
-  "error": {
-    "code": "rate_limited",
-    "message": "gateway rate limit exceeded",
-    "retryable": true
-  }
-}
-```
-
-Once a request has been authenticated and authorized for its capability and
-board, it consumes quota even when its query, path values, JSON, or message are
-invalid. This prevents malformed signed traffic from bypassing limits.
-Oversized request bodies are the exception because the gateway rejects them
-before it can buffer the complete body and verify its signature.
-
-When a post was created through the gateway, its `origin` identifies the
-integration:
-
-```json
-{
-  "origin": { "kind": "integration", "name": "example" }
-}
-```
-
-Every posting integration has a unique secure tripcode. Configure the public
-`!!` value emitted by ptchan as `public_tripcode`; the secret remains in
-`PTCHAN_INTEGRATION_<NAME>_TRIPCODE`. Webhooks and thread reads identify origin
-by exact public-tripcode match, without storing post coordinates or matching
-message text. Matching posts include both the public `tripcode` and integration
-`origin`; the private tripcode secret is sent only to ptchan's posting form. A
-missing `origin` means the post does not carry a configured public tripcode.
-
-## Webhooks
-
-V1 emits:
-
-- `thread.created`
-- `post.created`
-
-Webhook delivery is durable and at-least-once. The gateway writes events and
-per-integration delivery rows to SQLite before sending webhooks, retries failed
-deliveries with backoff, and retains pending events until all deliveries have
-succeeded. Delivery attempts use bounded concurrency so a slow integration
-does not hold every healthy integration behind its request timeout.
-
-Every webhook body carries:
-
-```json
-{ "schema_version": "1" }
-```
-
-Ordering is best-effort. Integrations must use `x-ptchan-event-id` or
-`event_id` for idempotency and tolerate duplicate, delayed, or out-of-order
-events. Integrations that need current state should fetch the thread after a
-webhook instead of deriving correctness from webhook order.
-
-Webhook signatures are HMAC-SHA256 over:
-
-```text
-<timestamp>.<json body>
-```
-
-## Posting Replies
-
-```http
-POST /integration/v1/threads/test/397/replies
-content-type: application/json
-```
-
-```json
-{ "message": ">>405\nreply text", "sage": false }
-```
-
-Successful replies return post coordinates:
-
-```json
-{
-  "board": "test",
-  "thread_id": 397,
-  "post_id": 406,
-  "url": "https://ptchan.org/test/thread/397.html#406",
-  "origin": { "kind": "integration", "name": "example" }
-}
-```
-
-Errors return a stable code and retry hint:
-
-```json
-{
-  "error": {
-    "code": "rate_limited",
-    "message": "ptchan rate limit exceeded",
-    "retryable": true,
-    "upstream_status": 429
-  }
-}
-```
-
-Gateway-side rate limits use the same `rate_limited` code with the message
-`gateway rate limit exceeded` and no `upstream_status`. Upstream ptchan rate
-limits include `upstream_status`.
-
-Reply rejection messages are stable gateway-owned text. The gateway uses
-ptchan's response body only to classify the error code and never forwards the
-upstream message or response body to integrations.
-
-Every integration API failure uses the same JSON error envelope. Stable codes
-include `unauthorized`, `capability_not_enabled`, `invalid_json`,
-`invalid_query`, `invalid_board`, `invalid_thread_id`, `missing_message`,
-`message_too_long`, `invalid_message`, `board_not_allowed`, `payload_too_large`,
-`captcha_required`, `block_bypass_required`, `rate_limited`,
-`thread_not_found`, `upstream_unavailable`, `thread_locked`,
-`thread_reply_limit`, `board_locked`, `rejected`, and
-`reply_state_unknown`.
-
-`reply_state_unknown` means ptchan may already have accepted the reply, so check
-the thread before retrying.
-
-File uploads and new thread creation are not part of the current write surface.
-
-## Metrics
-
-`GET /metrics` exposes Prometheus text metrics.
-
-- Upstream socket/session health: `ptchan_upstream_required`,
-  `ptchan_upstream_auth_healthy`, `ptchan_socket_joined`,
-  `ptchan_socket_connection_attempts_total`,
-  `ptchan_socket_active_connections`, `ptchan_socket_connection_seconds`,
-  `ptchan_socket_join_failures_total`,
-  `ptchan_socket_last_join_timestamp_seconds`, `ptchan_session_refresh_total`,
-  and `ptchan_session_expires_at_seconds`.
-- Event intake and privacy filtering: `ptchan_socket_events_total`,
-  `ptchan_socket_last_event_timestamp_seconds`, `ptchan_redaction_drops_total`.
-- Webhook backlog and delivery behavior: `ptchan_webhook_pending`,
-  `ptchan_webhook_pending_by_webhook`, `ptchan_webhook_deliveries_total`,
-  `ptchan_webhook_delivery_seconds`, and
-  `ptchan_webhook_oldest_pending_seconds`.
-- Integration API usage and latency: `ptchan_reading_requests_total`,
-  `ptchan_reading_request_seconds`, `ptchan_posting_requests_total`, and
-  `ptchan_posting_request_seconds`, labeled by integration, board, and result.
-  Gateway-enforced rate limits also increment
-  `ptchan_gateway_rate_limited_requests_total`, labeled by integration, board,
-  capability, and scope (`integration` or `global`).
-- Storage health: `ptchan_sqlite_errors_total`.
-- Gateway process health on Linux/container deployments. The standard
-  Prometheus process collector exposes:
-  `process_cpu_seconds_total`, `process_resident_memory_bytes`,
-  `process_virtual_memory_bytes`, `process_open_fds`, `process_max_fds`,
-  `process_threads`, and `process_start_time_seconds`. The gateway also exposes
-  Linux `/proc` fallback gauges: `ptchan_process_cpu_ticks_total`,
-  `ptchan_process_threads`, and `ptchan_process_open_fds`.
-
-Metrics must not expose cookies, signatures, raw upstream payloads, poster
+`GET /metrics` reports upstream session/socket health, intake/redaction,
+webhook backlog and delivery outcomes, integration read/post outcomes, storage
+errors, and process health. It must never expose secrets, raw upstream payloads,
 fingerprints, moderation identity fields, or per-poster labels.
 
-## Docker
+See [metric families and access requirements](docs/operations.md#metrics-and-access)
+for the complete inventory.
+
+For Docker deployment:
 
 ```bash
 make docker-deploy GATEWAY_ENV=prod DOCKER_NETWORK=integration-net
 make docker-logs GATEWAY_ENV=prod
 ```
 
-Docker images are tagged with the current commit by default, for example
-`ptchan-gateway:abc1234`. Override `IMAGE` when pushing to a registry or using a
-specific tag:
-
-```bash
-make docker-deploy GATEWAY_ENV=prod IMAGE=registry.example/ptchan-gateway:abc1234
-```
-
-`GATEWAY_ENV` selects the environment-specific inputs and resource names:
-
-```text
-GATEWAY_ENV=dev   -> .env.dev,  config/dev.toml,  ptchan-gateway-dev,  ptchan-gateway-dev-data
-GATEWAY_ENV=prod  -> .env.prod, config/prod.toml, ptchan-gateway-prod, ptchan-gateway-prod-data
-```
-
-Inside the container, the selected config is mounted read-only at
-`/etc/ptchan-gateway/config.toml` and SQLite is stored at
-`/data/ptchan-gateway.db` on the named Docker volume. `docker-deploy` replaces
-the container but keeps the volume.
-
-Dev and prod can run on the same host at the same time. They see the same
-SQLite path inside their containers, but that path is backed by different named
-volumes:
-
-```text
-ptchan-gateway-dev   -> /data/ptchan-gateway.db on ptchan-gateway-dev-data
-ptchan-gateway-prod  -> /data/ptchan-gateway.db on ptchan-gateway-prod-data
-```
-
-Logs go to stdout/stderr and are captured by Docker:
-
-```bash
-docker logs -f ptchan-gateway-prod
-```
-
-`DOCKER_NETWORK` should name an existing Docker network when integrations are
-addressed by container name. The Makefile does not publish host ports by
-default; on a shared Docker network, integrations can reach the gateway by
-container name, such as `http://ptchan-gateway-prod:8080`.
+`GATEWAY_ENV` selects `.env.<env>`, `config/<env>.toml`, and separate container
+and SQLite-volume names. The selected config is mounted read-only, SQLite lives
+on the named volume, and `docker-deploy` replaces the container without removing
+that volume. Set `IMAGE` to override the default commit-tagged image. The
+Makefile does not publish host ports; use an existing `DOCKER_NETWORK` when
+integrations should reach the gateway by container name.
