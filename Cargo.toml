@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
-axum = "0.7"
+axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 cookie_store = { version = "0.22", default-features = false }
 hex = "0.4"
