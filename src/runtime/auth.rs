@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::{
@@ -47,7 +47,6 @@ impl IntoResponse for AuthError {
     }
 }
 
-#[axum::async_trait]
 impl FromRequestParts<AppState> for VerifiedReading {
     type Rejection = Response;
 
@@ -202,7 +201,7 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, Method, Uri};
     use chrono::{Duration, Utc};
-    use hmac::Mac;
+    use hmac::{KeyInit, Mac};
 
     use super::{verify_request_headers, verify_request_signature, HmacSha256};
 
