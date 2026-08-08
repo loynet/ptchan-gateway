@@ -104,8 +104,8 @@ build:
 	cp target/release/$(BINARY) ./$(BINARY)
 
 tools:
-	cargo install cargo-machete
-	cargo install --locked cargo-deny
+	command -v cargo-machete >/dev/null 2>&1 || cargo install cargo-machete
+	command -v cargo-deny >/dev/null 2>&1 || cargo install --locked cargo-deny
 
 doctor:
 	@printf 'rustc: '; rustc --version

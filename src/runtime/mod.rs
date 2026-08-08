@@ -145,11 +145,11 @@ fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/integration/v1/openapi.json", get(openapi_handler))
         .route(
-            "/integration/v1/threads/:board/:thread_id",
+            "/integration/v1/threads/{board}/{thread_id}",
             get(integration_thread),
         )
         .route(
-            "/integration/v1/threads/:board/:thread_id/replies",
+            "/integration/v1/threads/{board}/{thread_id}/replies",
             post(integration_reply),
         )
         .with_state(state)
@@ -216,7 +216,7 @@ mod tests {
         response::{IntoResponse, Response},
     };
     use chrono::Utc;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use serde_json::Value;
     use sha2::Sha256;
     use tower::ServiceExt;

@@ -186,7 +186,6 @@ pub(super) struct SignedReply {
     started_at: Instant,
 }
 
-#[axum::async_trait]
 impl FromRequest<AppState> for SignedReply {
     type Rejection = Response;
 
