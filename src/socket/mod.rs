@@ -16,7 +16,10 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{
         client::IntoClientRequest,
-        http::header::{COOKIE, ORIGIN, USER_AGENT},
+        http::{
+            header::{COOKIE, ORIGIN, USER_AGENT},
+            Request,
+        },
         Message,
     },
 };
@@ -37,6 +40,11 @@ mod protocol;
 const ROOM: &str = "globalmanage-recent-hashed";
 const RECONNECT_MIN: Duration = Duration::from_secs(3);
 const RECONNECT_MAX: Duration = Duration::from_mins(1);
+const ENGINE_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+const LIVENESS_GRACE: Duration = Duration::from_secs(5);
+// Room broadcasts can stall while the websocket transport remains open. Rejoin
+// periodically so a stale subscription cannot persist indefinitely.
+const SOCKET_REFRESH_INTERVAL: Duration = Duration::from_hours(2);
 pub(crate) struct Supervisor {
     pub(crate) cfg: PtchanConfig,
     pub(crate) cookie: Arc<SessionCookie>,
@@ -68,6 +76,10 @@ pub(crate) async fn supervise(supervisor: Supervisor, mut shutdown: watch::Recei
 
         let result = tokio::select! {
             result = run_socket_once(&supervisor) => result,
+            () = time::sleep(SOCKET_REFRESH_INTERVAL) => {
+                info!(room = ROOM, interval = ?SOCKET_REFRESH_INTERVAL, "refreshing socket connection");
+                Ok(true)
+            }
             _ = shutdown.changed() => {
                 supervisor.status.set_upstream_joined(false);
                 return;
@@ -98,40 +110,28 @@ pub(crate) async fn supervise(supervisor: Supervisor, mut shutdown: watch::Recei
 
 async fn run_socket_once(supervisor: &Supervisor) -> Result<bool> {
     let base_url = supervisor.cfg.base_url.clone();
-    let origin = socket_origin(&supervisor.cfg.base_url)?;
-    let socket_url = socket_url(&supervisor.cfg.base_url)?;
-    let mut request = socket_url
-        .into_client_request()
-        .context("build socket request")?;
-    let headers = request.headers_mut();
-    headers.insert(
-        USER_AGENT,
-        config::gateway_user_agent()
-            .parse()
-            .context("build socket user-agent header")?,
-    );
-    headers.insert(
-        ORIGIN,
-        origin.parse().context("build socket origin header")?,
-    );
-    headers.insert(
-        COOKIE,
-        supervisor
-            .cookie
-            .get()
-            .parse()
-            .context("build socket cookie header")?,
-    );
+    let request = socket_request(&supervisor.cfg, &supervisor.cookie)?;
 
     debug!(room = ROOM, base_url = %supervisor.cfg.base_url, "connecting socket");
     let (mut socket, _response) = connect_async(request).await.context("connect socket")?;
     let _connection_guard = SocketConnectionGuard::new();
     let mut joined = false;
+    let mut liveness = ReceiveLiveness::new();
 
     while supervisor.status.auth_healthy() {
         let message = tokio::select! {
             message = socket.next() => message,
-            () = time::sleep(Duration::from_secs(1)) => continue,
+            () = time::sleep(liveness.remaining()) => {
+                metrics::SOCKET_LIVENESS_TIMEOUTS.inc();
+                supervisor.status.set_upstream_joined(false);
+                warn!(
+                    room = ROOM,
+                    silence = ?liveness.silence(),
+                    allowed_silence = ?liveness.allowed_silence(),
+                    "socket inbound liveness deadline exceeded"
+                );
+                break;
+            }
         };
         let Some(message) = message else {
             info!("socket closed");
@@ -140,10 +140,27 @@ async fn run_socket_once(supervisor: &Supervisor) -> Result<bool> {
         let message = message.context("read socket message")?;
         match message {
             Message::Text(text) => {
-                match handle_socket_text(&text, &mut socket, supervisor, &base_url, &mut joined)
+                let packet = match protocol::decode(&text) {
+                    Ok(packet) => packet,
+                    Err(err) => {
+                        warn!(error = %err, payload_bytes = text.len(), "socket protocol packet rejected");
+                        continue;
+                    }
+                };
+                liveness.observe_packet();
+                match handle_socket_packet(packet, &mut socket, supervisor, &base_url, &mut joined)
                     .await?
                 {
                     SocketTextResult::Continue => {}
+                    SocketTextResult::EngineOpened { heartbeat } => {
+                        liveness.set_heartbeat(heartbeat);
+                        info!(
+                            ping_interval = ?heartbeat.ping_interval,
+                            ping_timeout = ?heartbeat.ping_timeout,
+                            allowed_silence = ?liveness.allowed_silence(),
+                            "socket engine.io heartbeat configured"
+                        );
+                    }
                     SocketTextResult::RoomJoinEmitted => {
                         info!(room = ROOM, "socket connected; room join emitted");
                     }
@@ -154,10 +171,13 @@ async fn run_socket_once(supervisor: &Supervisor) -> Result<bool> {
                 }
             }
             Message::Binary(_) => debug!("socket binary message ignored"),
-            Message::Ping(payload) => socket
-                .send(Message::Pong(payload))
-                .await
-                .context("send websocket pong")?,
+            Message::Ping(payload) => {
+                liveness.observe_packet();
+                socket
+                    .send(Message::Pong(payload))
+                    .await
+                    .context("send websocket pong")?;
+            }
             Message::Close(frame) => {
                 if let Some(frame) = frame {
                     info!(
@@ -177,10 +197,76 @@ async fn run_socket_once(supervisor: &Supervisor) -> Result<bool> {
     Ok(joined)
 }
 
+fn socket_request(cfg: &PtchanConfig, cookie: &SessionCookie) -> Result<Request<()>> {
+    let origin = socket_origin(&cfg.base_url)?;
+    let socket_url = socket_url(&cfg.base_url)?;
+    let mut request = socket_url
+        .into_client_request()
+        .context("build socket request")?;
+    let headers = request.headers_mut();
+    headers.insert(
+        USER_AGENT,
+        config::gateway_user_agent()
+            .parse()
+            .context("build socket user-agent header")?,
+    );
+    headers.insert(
+        ORIGIN,
+        origin.parse().context("build socket origin header")?,
+    );
+    headers.insert(
+        COOKIE,
+        cookie.get().parse().context("build socket cookie header")?,
+    );
+    Ok(request)
+}
+
 enum SocketTextResult {
     Continue,
+    EngineOpened { heartbeat: protocol::Heartbeat },
     RoomJoinEmitted,
     Closed,
+}
+
+struct ReceiveLiveness {
+    last_inbound: Instant,
+    heartbeat: Option<protocol::Heartbeat>,
+}
+
+impl ReceiveLiveness {
+    fn new() -> Self {
+        Self {
+            last_inbound: Instant::now(),
+            heartbeat: None,
+        }
+    }
+
+    fn observe_packet(&mut self) {
+        self.last_inbound = Instant::now();
+        metrics::observe_now(&metrics::SOCKET_LAST_INBOUND_TIMESTAMP_SECONDS);
+    }
+
+    fn set_heartbeat(&mut self, heartbeat: protocol::Heartbeat) {
+        self.heartbeat = Some(heartbeat);
+    }
+
+    fn allowed_silence(&self) -> Duration {
+        self.heartbeat.map_or(ENGINE_OPEN_TIMEOUT, |heartbeat| {
+            heartbeat
+                .ping_interval
+                .saturating_mul(2)
+                .saturating_add(heartbeat.ping_timeout)
+                .saturating_add(LIVENESS_GRACE)
+        })
+    }
+
+    fn remaining(&self) -> Duration {
+        self.allowed_silence().saturating_sub(self.silence())
+    }
+
+    fn silence(&self) -> Duration {
+        self.last_inbound.elapsed()
+    }
 }
 
 struct SocketConnectionGuard {
@@ -203,8 +289,8 @@ impl Drop for SocketConnectionGuard {
     }
 }
 
-async fn handle_socket_text<S>(
-    text: &str,
+async fn handle_socket_packet<S>(
+    packet: protocol::Packet,
     socket: &mut S,
     supervisor: &Supervisor,
     base_url: &str,
@@ -213,19 +299,13 @@ async fn handle_socket_text<S>(
 where
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
-    let packet = match protocol::decode(text) {
-        Ok(packet) => packet,
-        Err(err) => {
-            warn!(error = %err, payload_bytes = text.len(), "socket protocol packet rejected");
-            return Ok(SocketTextResult::Continue);
-        }
-    };
     match packet {
-        protocol::Packet::EngineOpen => {
+        protocol::Packet::EngineOpen { heartbeat } => {
             socket
                 .send(Message::Text("40".into()))
                 .await
                 .context("send socket namespace connect")?;
+            return Ok(SocketTextResult::EngineOpened { heartbeat });
         }
         protocol::Packet::EnginePing => {
             socket
@@ -365,5 +445,18 @@ mod tests {
     fn recognizes_room_join_message() {
         assert!(message_is_joined(&[json!("ignored"), json!("joined")]));
         assert!(!message_is_joined(&[json!("not joined")]));
+    }
+
+    #[test]
+    fn permits_one_missed_heartbeat_before_timing_out() {
+        let liveness = ReceiveLiveness {
+            last_inbound: Instant::now(),
+            heartbeat: Some(protocol::Heartbeat {
+                ping_interval: Duration::from_secs(25),
+                ping_timeout: Duration::from_secs(20),
+            }),
+        };
+
+        assert_eq!(liveness.allowed_silence(), Duration::from_secs(75));
     }
 }

@@ -84,6 +84,20 @@ pub(crate) static SOCKET_LAST_JOIN_TIMESTAMP_SECONDS: LazyLock<Gauge> = LazyLock
     )
     .unwrap()
 });
+pub(crate) static SOCKET_LAST_INBOUND_TIMESTAMP_SECONDS: LazyLock<Gauge> = LazyLock::new(|| {
+    prometheus::register_gauge!(
+        "ptchan_socket_last_inbound_timestamp_seconds",
+        "Unix timestamp of the last valid inbound upstream socket packet"
+    )
+    .unwrap()
+});
+pub(crate) static SOCKET_LIVENESS_TIMEOUTS: LazyLock<IntCounter> = LazyLock::new(|| {
+    prometheus::register_int_counter!(
+        "ptchan_socket_liveness_timeouts_total",
+        "Socket connections closed after missing the inbound heartbeat deadline"
+    )
+    .unwrap()
+});
 pub(crate) static SESSION_REFRESH: LazyLock<IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
         "ptchan_session_refresh_total",
@@ -220,6 +234,8 @@ pub(crate) fn init() {
     LazyLock::force(&SOCKET_EVENTS);
     LazyLock::force(&SOCKET_LAST_EVENT_TIMESTAMP_SECONDS);
     LazyLock::force(&SOCKET_LAST_JOIN_TIMESTAMP_SECONDS);
+    LazyLock::force(&SOCKET_LAST_INBOUND_TIMESTAMP_SECONDS);
+    LazyLock::force(&SOCKET_LIVENESS_TIMEOUTS);
     LazyLock::force(&SESSION_REFRESH);
     LazyLock::force(&SESSION_EXPIRES_AT_SECONDS);
     LazyLock::force(&WEBHOOK_DELIVERIES);

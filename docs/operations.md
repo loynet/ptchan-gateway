@@ -63,7 +63,9 @@ Metric families cover:
   `ptchan_socket_connection_attempts_total`,
   `ptchan_socket_active_connections`, `ptchan_socket_connection_seconds`,
   `ptchan_socket_join_failures_total`,
-  `ptchan_socket_last_join_timestamp_seconds`, `ptchan_session_refresh_total`,
+  `ptchan_socket_last_join_timestamp_seconds`,
+  `ptchan_socket_last_inbound_timestamp_seconds`,
+  `ptchan_socket_liveness_timeouts_total`, `ptchan_session_refresh_total`,
   and `ptchan_session_expires_at_seconds`;
 - intake and privacy filtering: `ptchan_socket_events_total`,
   `ptchan_socket_last_event_timestamp_seconds`, and `ptchan_redaction_drops_total`;
