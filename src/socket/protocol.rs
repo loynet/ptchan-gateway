@@ -1,8 +1,16 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Heartbeat {
+    pub(super) ping_interval: Duration,
+    pub(super) ping_timeout: Duration,
+}
+
 pub(super) enum Packet {
-    EngineOpen,
+    EngineOpen { heartbeat: Heartbeat },
     EnginePing,
     EngineClose,
     SocketConnected,
@@ -17,7 +25,7 @@ pub(super) fn decode(text: &str) -> Result<Packet> {
         .split_at_checked(1)
         .context("socket packet was empty or did not start with an ASCII packet code")?;
     match code {
-        "0" => Ok(Packet::EngineOpen),
+        "0" => decode_engine_open(payload),
         "1" => Ok(Packet::EngineClose),
         "2" => Ok(Packet::EnginePing),
         "4" => decode_socketio(payload),
@@ -26,6 +34,31 @@ pub(super) fn decode(text: &str) -> Result<Packet> {
             code: code.to_string(),
         }),
     }
+}
+
+fn decode_engine_open(payload: &str) -> Result<Packet> {
+    let value =
+        serde_json::from_str::<Value>(payload).context("engine.io open payload was not JSON")?;
+    let object = value
+        .as_object()
+        .context("engine.io open payload was not an object")?;
+    let ping_interval = duration_millis(object, "pingInterval")?;
+    let ping_timeout = duration_millis(object, "pingTimeout")?;
+    Ok(Packet::EngineOpen {
+        heartbeat: Heartbeat {
+            ping_interval,
+            ping_timeout,
+        },
+    })
+}
+
+fn duration_millis(object: &serde_json::Map<String, Value>, name: &str) -> Result<Duration> {
+    let millis = object
+        .get(name)
+        .and_then(Value::as_u64)
+        .filter(|millis| *millis > 0)
+        .with_context(|| format!("engine.io open payload did not include a positive {name}"))?;
+    Ok(Duration::from_millis(millis))
 }
 
 fn decode_socketio(text: &str) -> Result<Packet> {
@@ -73,9 +106,21 @@ mod tests {
 
     #[test]
     fn decodes_engine_and_socket_packets() {
-        assert!(matches!(decode("0{}").unwrap(), Packet::EngineOpen));
+        let Packet::EngineOpen { heartbeat } =
+            decode(r#"0{"pingInterval":25000,"pingTimeout":20000}"#).unwrap()
+        else {
+            panic!("expected engine open");
+        };
+        assert_eq!(heartbeat.ping_interval, Duration::from_secs(25));
+        assert_eq!(heartbeat.ping_timeout, Duration::from_secs(20));
         assert!(matches!(decode("2").unwrap(), Packet::EnginePing));
         assert!(matches!(decode("40{}").unwrap(), Packet::SocketConnected));
+    }
+
+    #[test]
+    fn rejects_engine_open_without_heartbeat_settings() {
+        assert!(decode("0{}").is_err());
+        assert!(decode(r#"0{"pingInterval":0,"pingTimeout":20000}"#).is_err());
     }
 
     #[test]
