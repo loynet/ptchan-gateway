@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-ARG RUST_VERSION=1.93.1
+ARG RUST_VERSION=1.97.1
 FROM rust:${RUST_VERSION}-bookworm AS build
 
 WORKDIR /src
@@ -29,7 +29,6 @@ RUN apt-get update \
 	&& rm -rf /var/lib/apt/lists/* \
 	&& mkdir -p /data /etc/ptchan-gateway \
 	&& chown -R 65532:65532 /data /etc/ptchan-gateway
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /usr/local/bin/ptchan-gateway /usr/local/bin/ptchan-gateway
 
 USER 65532:65532
