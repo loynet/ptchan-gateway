@@ -23,7 +23,7 @@ serde_path_to_error = "0.1"
 schemars = { version = "1.2", features = ["chrono04"] }
 sha2 = "0.11"
 tokio = { version = "1.40", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-rusqlite = { version = "0.7", features = ["bundled"] }
+tokio-rusqlite = { version = "0.8", features = ["bundled"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 toml = "1.1"
 tracing = "0.1"
